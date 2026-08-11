@@ -502,6 +502,91 @@ def test_fill_merged_cell():
     check((1, 2, 1, 3) in [tuple(m) for m in s.merged_cells], 'xls 合并单元格保留')
 
 
+def test_delete():
+    """行/列删除：等于/包含匹配，.xlsx 与 .xls 两种格式。"""
+    from openpyxl import Workbook as WX, load_workbook as LW
+    clean_out()
+
+    # --- 源 .xlsx ---
+    src = OUT / 'd.xlsx'
+    wb = WX()
+    ws = wb.active
+    ws['A1'] = '项目'
+    ws['B1'] = '金额'
+    ws['A2'] = '作废单'
+    ws['B2'] = 10
+    ws['A3'] = '正常单'
+    ws['B3'] = 20
+    ws['A4'] = '另一张'
+    ws['B4'] = 30
+    ws['A5'] = '作废2'
+    ws['B5'] = 40
+    ws['D1'] = '待删列'
+    wb.save(src)
+
+    def do_delete(mode, terms, case=False):
+        plan, _ = excel_core.plan_delete([str(src)], mode, terms, OUT)
+        excel_core.execute_delete(plan, mode, terms, case, log)
+        return LW(plan[0].dst).worksheets[0]
+
+    # 行：包含"作废" → 删第2、5行
+    ws2 = do_delete('row', [('作废', 'contains')])
+    colA = [ws2.cell(row=r, column=1).value for r in range(1, ws2.max_row + 1)]
+    check(colA == ['项目', '正常单', '另一张'], f'行删除(包含作废) {colA}')
+
+    # 行：等于"正常单" → 删第3行
+    ws2 = do_delete('row', [('正常单', 'equals')])
+    colA = [ws2.cell(row=r, column=1).value for r in range(1, ws2.max_row + 1)]
+    check(colA == ['项目', '作废单', '另一张', '作废2'], f'行删除(等于) {colA}')
+
+    # 多条件：同时删"作废"(包含) 和 "另一张"(等于) 两行
+    ws2 = do_delete('row', [('作废', 'contains'), ('另一张', 'equals')])
+    colA = [ws2.cell(row=r, column=1).value for r in range(1, ws2.max_row + 1)]
+    check(colA == ['项目', '正常单'], f'多条件同时删除 {colA}')
+
+    # 列：包含"待删" → 删 D 列
+    ws2 = do_delete('column', [('待删', 'contains')])
+    check(ws2.max_column == 2, f'列删除后 max_column={ws2.max_column}')
+    check(ws2['A1'].value == '项目' and ws2['B1'].value == '金额', '列删除后保留 A、B 列')
+
+    # 预览统计
+    deleted, total = excel_core.count_delete(str(src), 'row', [('作废', 'contains')], False)
+    check(deleted == 2 and total == 5, f'预览统计 删2行/共5行 ({deleted},{total})')
+
+    # --- .xls ---
+    import xlwt
+    src_x = OUT / 'd.xls'
+    wb = xlwt.Workbook()
+    ws = wb.add_sheet('S')
+    for r, v in enumerate(['项目', '作废单', '正常单', '作废2'], start=0):
+        ws.write(r, 0, v)
+    wb.save(str(src_x))
+    plan, _ = excel_core.plan_delete([str(src_x)], 'row', [('作废', 'contains')], OUT)
+    excel_core.execute_delete(plan, 'row', [('作废', 'contains')], False, log)
+    import xlrd
+    s = xlrd.open_workbook(str(plan[0].dst)).sheet_by_index(0)
+    col = [s.cell_value(r, 0) for r in range(s.nrows)]
+    check(col == ['项目', '正常单'], f'xls 行删除(包含作废) {col}')
+
+    # --- 合并单元格处理：删除含合并单元格的行，合并区跟随上移 ---
+    tpl = OUT / 'm.xlsx'
+    wb = WX()
+    ws = wb.active
+    ws.merge_cells('B2:B3')
+    ws['B2'] = '合并'
+    ws['A1'] = 'h'
+    ws['A3'] = '被删'
+    wb.save(tpl)
+    plan, _ = excel_core.plan_delete([str(tpl)], 'row', [('被删', 'contains')], OUT)
+    excel_core.execute_delete(plan, 'row', [('被删', 'contains')], False, log)
+    ws2 = LW(plan[0].dst).worksheets[0]
+    check(ws2['B2'].value == '合并', '删除后合并内容保留')
+    ranges = [str(r) for r in ws2.merged_cells.ranges]
+    check('B2:B2' in ranges or 'B2' in [str(r) for r in ws2.merged_cells.ranges]
+          or any('B2' in str(r) for r in ws2.merged_cells.ranges), f'合并区域调整 {ranges}')
+    check(ws2['A2'].value is None or ws2['A2'].value != '被删', '被删行已移除')
+
+
 if __name__ == '__main__':
     test_rename()
     test_rename_advanced()
@@ -511,4 +596,5 @@ if __name__ == '__main__':
     test_fill_column_merged()
     test_xls()
     test_fill_merged_cell()
+    test_delete()
     print('\n全部测试通过 ✅')

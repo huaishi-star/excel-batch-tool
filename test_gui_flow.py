@@ -136,6 +136,49 @@ def run_fill_column(app):
     print('模板填充-整列 GUI 流程 PASS')
 
 
+def run_delete(app):
+    """行/列删除 GUI 流程：预览统计 + 执行删除。"""
+    shutil.rmtree(OUT, ignore_errors=True)
+    OUT.mkdir()
+    # 造一个源文件
+    from openpyxl import Workbook
+    src = OUT / '待删.xlsx'
+    wb = Workbook()
+    ws = wb.active
+    ws['A1'] = '项目'
+    ws['A2'] = '作废单'
+    ws['A3'] = '正常单'
+    ws['A4'] = '作废2'
+    wb.save(src)
+
+    tab = app.delete_tab
+    tab.picker.files = [str(src)]
+    tab.picker._refresh()
+    tab.target_entry.insert(0, '作废')
+    tab._add_term()  # 添加条件"作废(包含)"
+    tab.out_var.set(str(OUT))
+
+    # 预览
+    tab._do_preview()
+    assert pump_until_idle(tab), '删除预览超时'
+    preview = tab.preview_text.get('1.0', 'end')
+    assert '将删除 2 行（共 4 行）' in preview, preview
+    print('  [预览] 统计 2 行正确')
+
+    # 执行（输出与源同目录，会触发改名提示；弹窗需放行）
+    appmod.messagebox.askyesno = lambda *a, **k: True
+    tab._run()
+    assert pump_until_idle(tab), '删除执行超时'
+    out_files = [p.name for p in OUT.glob('*.xlsx') if p.name != '待删.xlsx']
+    assert out_files, '删除输出文件不存在'
+    from openpyxl import load_workbook
+    ws2 = load_workbook(OUT / out_files[0]).worksheets[0]
+    col = [ws2.cell(row=r, column=1).value for r in range(1, ws2.max_row + 1)]
+    assert col == ['项目', '正常单'], col
+    print('  [执行] 作废行已删除')
+    print('行/列删除 GUI 流程 PASS')
+
+
 def test_profiles():
     """规则/映射档案：保存 → 载入 → 删除；不保存文件列表/输出文件夹。"""
     with tempfile.TemporaryDirectory() as tmp:
@@ -216,6 +259,7 @@ def main():
         run_rename(a)
         run_fill(a)
         run_fill_column(a)
+        run_delete(a)
         test_profiles()
         print('\n全部 GUI 流程测试通过 ✅')
     finally:

@@ -152,6 +152,13 @@ class FillItem:
     dst: Path
 
 
+@dataclass
+class DeleteItem:
+    """行/列删除计划中的一项。"""
+    src: Path
+    dst: Path
+
+
 # ---------------------------------------------------------------------------
 # 单元格值 → 文本
 # ---------------------------------------------------------------------------
@@ -748,6 +755,272 @@ def execute_fill(template_path, plan: list[FillItem], mapping: list[tuple],
                         _w.close()
                     except Exception:
                         pass
+        if progress is not None:
+            progress(i + 1, total)
+    return {'ok': ok, 'skip': skip, 'fail': fail}
+
+
+# ---------------------------------------------------------------------------
+# 批量行/列删除
+# ---------------------------------------------------------------------------
+
+def _cell_matches(value, target, match_type: str, case_sensitive: bool) -> bool:
+    """判断单元格值是否满足单条删除条件：'contains' 包含 / 'equals' 等于。"""
+    if value is None:
+        return False
+    s = value_to_text(value)
+    t = str(target)
+    if match_type == 'contains':
+        return (t in s) if case_sensitive else (t.lower() in s.lower())
+    return (s.strip() == t.strip()) if case_sensitive else (s.strip().lower() == t.strip().lower())
+
+
+def _cell_matches_any(value, terms: list, case_sensitive: bool) -> bool:
+    """判断单元格值是否满足任意一条条件。terms = [(值, 匹配方式), ...]。"""
+    if value is None:
+        return False
+    for target, match_type in terms:
+        if _cell_matches(value, target, match_type, case_sensitive):
+            return True
+    return False
+
+
+def _rows_to_delete(ws, terms: list, case_sensitive: bool) -> set:
+    """扫描工作表中"任意单元格满足任意条件"的行。"""
+    deleted = set()
+    for row in range(1, ws.max_row + 1):
+        for col in range(1, ws.max_column + 1):
+            if _cell_matches_any(ws.cell(row=row, column=col).value, terms, case_sensitive):
+                deleted.add(row)
+                break
+    return deleted
+
+
+def _cols_to_delete(ws, terms: list, case_sensitive: bool) -> set:
+    """扫描工作表中"任意单元格满足任意条件"的列。"""
+    deleted = set()
+    for col in range(1, ws.max_column + 1):
+        for row in range(1, ws.max_row + 1):
+            if _cell_matches_any(ws.cell(row=row, column=col).value, terms, case_sensitive):
+                deleted.add(col)
+                break
+    return deleted
+
+
+def _fix_merges_after_row_delete(ws, deleted_rows: set):
+    """删除行后同步修正合并单元格：整块被删的移除，其余按上方删除数上移。"""
+    for mr in list(ws.merged_cells.ranges):
+        new_min = mr.min_row - sum(1 for r in deleted_rows if r < mr.min_row)
+        new_max = mr.max_row - sum(1 for r in deleted_rows if r <= mr.max_row)
+        if new_min > new_max:
+            ws.unmerge_cells(str(mr))
+        else:
+            mr.min_row = new_min
+            mr.max_row = new_max
+
+
+def _fix_merges_after_col_delete(ws, deleted_cols: set):
+    """删除列后同步修正合并单元格。"""
+    for mr in list(ws.merged_cells.ranges):
+        new_min = mr.min_col - sum(1 for c in deleted_cols if c < mr.min_col)
+        new_max = mr.max_col - sum(1 for c in deleted_cols if c <= mr.max_col)
+        if new_min > new_max:
+            ws.unmerge_cells(str(mr))
+        else:
+            mr.min_col = new_min
+            mr.max_col = new_max
+
+
+def _delete_openpyxl_rows(ws, deleted_rows: set):
+    """按连续块自下而上删除行。"""
+    _fix_merges_after_row_delete(ws, deleted_rows)
+    rows = sorted(deleted_rows)
+    i = len(rows) - 1
+    while i >= 0:
+        end = i
+        while i > 0 and rows[i] - rows[i - 1] == 1:
+            i -= 1
+        start = i
+        ws.delete_rows(rows[start], end - start + 1)
+        i -= 1
+
+
+def _delete_openpyxl_cols(ws, deleted_cols: set):
+    """按连续块自右向左删除列。"""
+    _fix_merges_after_col_delete(ws, deleted_cols)
+    cols = sorted(deleted_cols)
+    i = len(cols) - 1
+    while i >= 0:
+        end = i
+        while i > 0 and cols[i] - cols[i - 1] == 1:
+            i -= 1
+        start = i
+        ws.delete_cols(cols[start], end - start + 1)
+        i -= 1
+
+
+def _delete_openpyxl(src, dst, mode: str, terms: list, case_sensitive: bool):
+    """用 openpyxl 删除 .xlsx/.xlsm 中的行/列并保存。"""
+    wb = load_workbook(str(src))
+    try:
+        ws = wb.worksheets[0]
+        if mode == 'row':
+            _delete_openpyxl_rows(ws, _rows_to_delete(ws, terms, case_sensitive))
+        else:
+            _delete_openpyxl_cols(ws, _cols_to_delete(ws, terms, case_sensitive))
+        wb.save(str(dst))
+    finally:
+        wb.close()
+
+
+def _xls_deleted_rows_cols(sheet, mode: str, terms: list, case_sensitive: bool) -> tuple:
+    """统计 .xls 中要删除的行/列。"""
+    if mode == 'row':
+        deleted = set()
+        for r in range(sheet.nrows):
+            for c in range(sheet.ncols):
+                if _cell_matches_any(sheet.cell_value(r, c), terms, case_sensitive):
+                    deleted.add(r)
+                    break
+        return deleted, set()
+    deleted = set()
+    for c in range(sheet.ncols):
+        for r in range(sheet.nrows):
+            if _cell_matches_any(sheet.cell_value(r, c), terms, case_sensitive):
+                deleted.add(c)
+                break
+    return set(), deleted
+
+
+def _rebuild_xls_deleted(book, src_sheet, deleted_rows: set, deleted_cols: set, output_path):
+    """跳过被删除的行/列，用 xlwt 重建 .xls 文件。"""
+    row_map = {}
+    new_r = 0
+    for r in range(src_sheet.nrows):
+        if r not in deleted_rows:
+            row_map[r] = new_r
+            new_r += 1
+    col_map = {}
+    new_c = 0
+    for c in range(src_sheet.ncols):
+        if c not in deleted_cols:
+            col_map[c] = new_c
+            new_c += 1
+    wb = xlwt.Workbook()
+    ws = wb.add_sheet(src_sheet.name or 'Sheet1')
+    for r in range(src_sheet.nrows):
+        if r in deleted_rows:
+            continue
+        for c in range(src_sheet.ncols):
+            if c in deleted_cols:
+                continue
+            ws.write(row_map[r], col_map[c], src_sheet.cell_value(r, c),
+                     _make_xlwt_style(book, src_sheet.cell_xf_index(r, c)))
+    # 合并单元格：左上角被删除则丢弃，否则按保留行列收缩
+    for (rlo, rhi, clo, chi) in src_sheet.merged_cells:
+        if rlo not in row_map or clo not in col_map:
+            continue
+        last_r = rhi - 1
+        while last_r >= rlo and last_r not in row_map:
+            last_r -= 1
+        last_c = chi - 1
+        while last_c >= clo and last_c not in col_map:
+            last_c -= 1
+        if last_r < rlo or last_c < clo:
+            continue
+        ws.write_merge(row_map[rlo], row_map[last_r], col_map[clo], col_map[last_c],
+                       src_sheet.cell_value(rlo, clo),
+                       _make_xlwt_style(book, src_sheet.cell_xf_index(rlo, clo)))
+    for col_idx, colinfo in src_sheet.colinfo_map.items():
+        if col_idx in col_map:
+            ws.col(col_map[col_idx]).width = colinfo.width
+    for r, rowinfo in src_sheet.rowinfo_map.items():
+        if r in row_map and rowinfo.height:
+            ws.row(row_map[r]).height = rowinfo.height
+    wb.save(str(output_path))
+
+
+def _delete_xls(src, dst, mode: str, terms: list, case_sensitive: bool):
+    """删除 .xls 中的行/列并重建保存。"""
+    book = xlrd.open_workbook(str(src), formatting_info=True)
+    try:
+        sheet = book.sheet_by_index(0)
+        deleted_rows, deleted_cols = _xls_deleted_rows_cols(sheet, mode, terms, case_sensitive)
+        _rebuild_xls_deleted(book, sheet, deleted_rows, deleted_cols, dst)
+    finally:
+        book.release_resources()
+
+
+def plan_delete(files: Iterable, mode: str, terms: list, out_dir,
+                ) -> tuple[list[DeleteItem], list[tuple]]:
+    """生成行/列删除计划：输出到 out_dir，文件名保持原样（重名自动去重）。
+
+    mode/terms 仅用于接口一致性，命名不依赖删除条件。
+    """
+    used: set[str] = set()
+    plan: list[DeleteItem] = []
+    errors: list[tuple] = []
+    for f in files:
+        f = Path(f)
+        try:
+            dst = build_dest_name(f.stem, f.suffix.lower(), out_dir, used)
+            used.add(dst.name.lower())
+            plan.append(DeleteItem(src=f, dst=dst))
+        except Exception as e:
+            errors.append((f, str(e)))
+    return plan, errors
+
+
+def count_delete(src, mode: str, terms: list, case_sensitive: bool) -> tuple:
+    """统计要删除的行/列数与总数（供预览）。返回 (删除数, 总数)。"""
+    if Path(src).suffix.lower() == '.xls':
+        book = xlrd.open_workbook(str(src))
+        try:
+            sheet = book.sheet_by_index(0)
+            dr, dc = _xls_deleted_rows_cols(sheet, mode, terms, case_sensitive)
+            if mode == 'row':
+                return len(dr), sheet.nrows
+            return len(dc), sheet.ncols
+        finally:
+            book.release_resources()
+    wb = load_workbook(str(src), read_only=True)
+    try:
+        ws = wb.worksheets[0]
+        if mode == 'row':
+            deleted = _rows_to_delete(ws, terms, case_sensitive)
+            return len(deleted), ws.max_row
+        deleted = _cols_to_delete(ws, terms, case_sensitive)
+        return len(deleted), ws.max_column
+    finally:
+        wb.close()
+
+
+def execute_delete(plan: list[DeleteItem], mode: str, terms: list, case_sensitive: bool,
+                   log: LogFn, progress: Optional[ProgressFn] = None,
+                   cancel_event: Optional[Event] = None) -> dict:
+    """执行行/列删除计划（terms = [(值, 匹配方式), ...]）。返回 {'ok': n, 'skip': n, 'fail': n}。"""
+    if not plan:
+        return {'ok': 0, 'skip': 0, 'fail': 0}
+    plan[0].dst.parent.mkdir(parents=True, exist_ok=True)
+    total = len(plan)
+    ok = skip = fail = 0
+    for i, item in enumerate(plan):
+        if cancel_event is not None and cancel_event.is_set():
+            log('[取消] 用户取消操作')
+            break
+        try:
+            if item.src.suffix.lower() == '.xls':
+                _delete_xls(item.src, item.dst, mode, terms, case_sensitive)
+            else:
+                _delete_openpyxl(item.src, item.dst, mode, terms, case_sensitive)
+            ok += 1
+            log(f'[OK] {item.src.name} → {item.dst.name}')
+        except PermissionError:
+            skip += 1
+            log(f'[跳过] {item.src.name}：文件被占用，已跳过')
+        except Exception as e:
+            fail += 1
+            log(f'[失败] {item.src.name}：{e}')
         if progress is not None:
             progress(i + 1, total)
     return {'ok': ok, 'skip': skip, 'fail': fail}

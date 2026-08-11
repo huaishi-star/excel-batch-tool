@@ -932,6 +932,229 @@ class FillTab(BaseTab):
 
 
 # ---------------------------------------------------------------------------
+# Tab 3：行/列删除
+# ---------------------------------------------------------------------------
+
+class DeleteTab(BaseTab):
+    def __init__(self, master):
+        super().__init__(master)
+        self._terms: list = []  # [(值, 匹配方式), ...]
+        self._build()
+
+    def _build(self):
+        # ① 选择文件
+        picker = FilePicker(self, text='① 选择要处理的文件（.xlsx / .xlsm / .xls）')
+        picker.pack(fill='x', padx=8, pady=(8, 4))
+        self.picker = picker
+
+        # ② 删除设置
+        cfg = ttk.LabelFrame(self, text='② 删除设置（删除整行/整列中任意单元格匹配条件的行/列）')
+        cfg.pack(fill='x', padx=8, pady=4)
+
+        row1 = ttk.Frame(cfg)
+        row1.pack(fill='x', padx=6, pady=(6, 2))
+        ttk.Label(row1, text='删除对象：').pack(side='left')
+        self.mode_var = tk.StringVar(value='row')
+        ttk.Radiobutton(row1, text='删除行', variable=self.mode_var, value='row').pack(side='left', padx=4)
+        ttk.Radiobutton(row1, text='删除列', variable=self.mode_var, value='column').pack(side='left', padx=4)
+
+        row2 = ttk.Frame(cfg)
+        row2.pack(fill='x', padx=6, pady=(6, 2))
+        ttk.Label(row2, text='查找条件（可添加多条，任一匹配即删除）：').pack(side='left')
+        self.case_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row2, text='区分大小写', variable=self.case_var).pack(side='left', padx=8)
+
+        # 条件列表编辑器
+        terms_row = ttk.Frame(cfg)
+        terms_row.pack(fill='x', padx=6, pady=2)
+
+        list_frame = ttk.Frame(terms_row)
+        list_frame.pack(side='left', fill='x', expand=True)
+        self.terms_list = tk.Listbox(list_frame, height=3, exportselection=False)
+        tsb = ttk.Scrollbar(list_frame, orient='vertical', command=self.terms_list.yview)
+        self.terms_list.configure(yscrollcommand=tsb.set)
+        tsb.pack(side='right', fill='y')
+        self.terms_list.pack(side='left', fill='both', expand=True)
+
+        btn_col = ttk.Frame(terms_row)
+        btn_col.pack(side='left', padx=(10, 0))
+        ttk.Label(btn_col, text='内容：').pack(anchor='w')
+        self.target_entry = ttk.Entry(btn_col, width=12)
+        self.target_entry.pack(fill='x', pady=(2, 2))
+        self.target_entry.bind('<Return>', lambda e: self._add_term())
+        ttk.Label(btn_col, text='匹配：').pack(anchor='w')
+        self.match_combo = ttk.Combobox(btn_col, state='readonly', width=8, values=['包含', '等于'])
+        self.match_combo.set('包含')
+        self.match_combo.pack(fill='x', pady=(2, 4))
+        ttk.Button(btn_col, text='添加', width=8, command=self._add_term).pack(pady=1)
+        ttk.Button(btn_col, text='删除', width=8, command=self._del_term).pack(pady=1)
+        ttk.Button(btn_col, text='上移', width=8, command=lambda: self._move_term(-1)).pack(pady=1)
+        ttk.Button(btn_col, text='下移', width=8, command=lambda: self._move_term(1)).pack(pady=1)
+
+        row3 = ttk.Frame(cfg)
+        row3.pack(fill='x', padx=6, pady=(2, 6))
+        ttk.Label(row3, text='说明：如添加"作废(包含)"和"计算(等于)"，则任一单元格含"作废"或等于"计算"的行都会被删除。',
+                  foreground='#57606a').pack(anchor='w')
+
+        # ③ 预览
+        prev = ttk.LabelFrame(self, text='③ 预览（统计每个文件将删除的行/列数）')
+        prev.pack(fill='x', padx=8, pady=4)
+        pframe = ttk.Frame(prev)
+        pframe.pack(fill='x', padx=6, pady=(6, 2))
+        self.preview_button = ttk.Button(pframe, text='预览', command=self._do_preview)
+        self.preview_button.pack(side='left')
+        ttk.Label(pframe, textvariable=self.status_var, foreground='#57606a').pack(side='left', padx=8)
+
+        pbox = ttk.Frame(prev)
+        pbox.pack(fill='both', expand=True, padx=6, pady=(2, 6))
+        self.preview_text = tk.Text(pbox, height=3, state='disabled', wrap='none',
+                                    font=('Microsoft YaHei UI', 9))
+        hsb = ttk.Scrollbar(pbox, orient='horizontal', command=self.preview_text.xview)
+        self.preview_text.configure(xscrollcommand=hsb.set)
+        hsb.pack(side='bottom', fill='x')
+        self.preview_text.pack(side='left', fill='both', expand=True)
+
+        # ④ 输出与执行
+        out = ttk.LabelFrame(self, text='④ 输出文件夹与执行（原文件保留不动，删除结果输出到新文件夹）')
+        out.pack(fill='x', padx=8, pady=4)
+        orow = ttk.Frame(out)
+        orow.pack(fill='x', padx=6, pady=(6, 2))
+        ttk.Label(orow, text='输出文件夹：').pack(side='left')
+        self.out_var = tk.StringVar()
+        ttk.Entry(orow, textvariable=self.out_var).pack(side='left', fill='x', expand=True)
+        ttk.Button(orow, text='浏览…', command=self._pick_outdir).pack(side='left', padx=4)
+
+        brow = ttk.Frame(out)
+        brow.pack(fill='x', padx=6, pady=(2, 6))
+        self.run_button = ttk.Button(brow, text='开始删除', command=self._run)
+        self.run_button.pack(side='left')
+        self.cancel_button = ttk.Button(brow, text='取消', command=self._cancel, state='disabled')
+        self.cancel_button.pack(side='left', padx=4)
+
+        self._build_log_area()
+
+    # ---- 条件编辑 ----
+    def _add_term(self):
+        v = self.target_entry.get().strip()
+        if not v:
+            messagebox.showinfo('提示', '请输入查找内容', parent=self)
+            return
+        m = 'contains' if self.match_combo.get() == '包含' else 'equals'
+        if (v, m) in self._terms:
+            messagebox.showinfo('提示', '该条件已存在', parent=self)
+            return
+        self._terms.append((v, m))
+        self.target_entry.delete(0, 'end')
+        self._refresh_terms()
+
+    def _del_term(self):
+        for i in reversed(self.terms_list.curselection()):
+            del self._terms[i]
+        self._refresh_terms()
+
+    def _move_term(self, delta: int):
+        sel = self.terms_list.curselection()
+        if not sel:
+            return
+        i = sel[0]
+        j = i + delta
+        if j < 0 or j >= len(self._terms):
+            return
+        self._terms[i], self._terms[j] = self._terms[j], self._terms[i]
+        self._refresh_terms()
+        self.terms_list.selection_set(j)
+        self.terms_list.activate(j)
+
+    def _refresh_terms(self):
+        self.terms_list.delete(0, 'end')
+        for v, m in self._terms:
+            self.terms_list.insert('end', f'{v}（{"包含" if m == "contains" else "等于"}）')
+
+    # ---- 交互 ----
+    def _pick_outdir(self):
+        d = filedialog.askdirectory(parent=self, title='选择输出文件夹')
+        if d:
+            self.out_var.set(d)
+
+    def _collect(self):
+        files = list(self.picker.files)
+        mode = self.mode_var.get()
+        terms = list(self._terms)
+        case_sensitive = bool(self.case_var.get())
+        out_dir = self.out_var.get().strip()
+        return files, mode, terms, case_sensitive, out_dir
+
+    def _validate(self, files, terms, out_dir, same_dir_warn=True) -> bool:
+        if not files:
+            messagebox.showwarning('提示', '请先选择要处理的文件', parent=self)
+            return False
+        if not terms:
+            messagebox.showwarning('提示', '请至少添加一条查找条件', parent=self)
+            return False
+        if not out_dir:
+            messagebox.showwarning('提示', '请选择输出文件夹', parent=self)
+            return False
+        if same_dir_warn:
+            from pathlib import Path as _P
+            same = [str(f) for f in files if _P(f).parent == _P(out_dir)]
+            if same:
+                if not messagebox.askyesno('提示',
+                        '输出文件夹与部分源文件所在文件夹相同。\n'
+                        '为避免覆盖原文件，输出文件会自动改名（如 名称 (1).xlsx）。\n\n'
+                        '建议选择不同的输出文件夹。是否继续？', parent=self):
+                    return False
+        return True
+
+    def _do_preview(self):
+        files, mode, terms, case_sensitive, out_dir = self._collect()
+        if not self._validate(files, terms, out_dir, same_dir_warn=False):
+            return
+        self._clear_log()
+        self.start_worker(self._worker_preview, (files, mode, terms, case_sensitive))
+
+    def _run(self):
+        files, mode, terms, case_sensitive, out_dir = self._collect()
+        if not self._validate(files, terms, out_dir, same_dir_warn=True):
+            return
+        self._clear_log()
+        self.start_worker(self._worker_run, (files, mode, terms, case_sensitive, out_dir))
+
+    # ---- 工作线程 ----
+    def _worker_preview(self, queue, cancel, files, mode, terms, case_sensitive):
+        unit = '行' if mode == 'row' else '列'
+        lines = []
+        for f in files:
+            try:
+                deleted, total = excel_core.count_delete(f, mode, terms, case_sensitive)
+                lines.append(f'{Path(f).name}  →  将删除 {deleted} {unit}（共 {total} {unit}）')
+            except Exception as e:
+                lines.append(f'[错误] 无法读取 {f}：{e}')
+        queue.put(('preview', lines))
+        queue.put(('done', None))
+
+    def _worker_run(self, queue, cancel, files, mode, terms, case_sensitive, out_dir):
+        log = lambda m: queue.put(('log', m))
+        plan, errors = excel_core.plan_delete(files, mode, terms, out_dir)
+        for f, msg in errors:
+            log(f'[失败] {f}：{msg}')
+        if not plan:
+            queue.put(('error', '没有可处理的文件'))
+            queue.put(('done', None))
+            return
+        summary = excel_core.execute_delete(plan, mode, terms, case_sensitive, log,
+                                            lambda d, t: queue.put(('progress', (d, t))),
+                                            cancel)
+        queue.put(('done', summary))
+
+    def _show_preview(self, lines):
+        self.preview_text.configure(state='normal')
+        self.preview_text.delete('1.0', 'end')
+        self.preview_text.insert('end', '\n'.join(lines) + ('\n' if lines else ''))
+        self.preview_text.configure(state='disabled')
+        self.status_var.set(f'预览：共 {len(lines)} 项')
+
+
+# ---------------------------------------------------------------------------
 # 主窗口
 # ---------------------------------------------------------------------------
 
@@ -952,8 +1175,10 @@ class App(tk.Tk):
         nb.pack(fill='both', expand=True)
         self.rename_tab = RenameTab(nb)
         self.fill_tab = FillTab(nb)
+        self.delete_tab = DeleteTab(nb)
         nb.add(self.rename_tab, text='批量重命名')
         nb.add(self.fill_tab, text='模板填充')
+        nb.add(self.delete_tab, text='行/列删除')
 
 
 def main():
