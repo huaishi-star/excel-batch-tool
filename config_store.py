@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 
 CONFIG_NAME = 'ExcelBatchTool_profiles.json'
-KINDS = ('rename', 'fill')
+KINDS = ('rename', 'fill', 'delete')
 
 # 测试可覆盖的基准目录；为 None 时使用默认位置
 _BASE: Path | None = None
@@ -46,7 +46,7 @@ def config_paths() -> list[Path]:
 
 def _load() -> dict:
     """读取全部档案；文件缺失或损坏时返回空结构。"""
-    empty = {'rename': {}, 'fill': {}}
+    empty = {'rename': {}, 'fill': {}, 'delete': {}}
     for p in config_paths():
         if not p.exists():
             continue
@@ -58,6 +58,7 @@ def _load() -> dict:
             return {
                 'rename': data.get('rename') or {},
                 'fill': data.get('fill') or {},
+                'delete': data.get('delete') or {},
             }
     return empty
 

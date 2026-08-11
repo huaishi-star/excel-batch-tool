@@ -241,6 +241,26 @@ def test_profiles():
                 a.fill_tab._mappings
             print('  [映射] 载入正确（含整列映射）')
 
+            # 删除规则保存/载入
+            a.delete_tab.target_entry.insert(0, '作废')
+            a.delete_tab._add_term()
+            a.delete_tab.target_entry.insert(0, '合计')
+            a.delete_tab.match_combo.set('等于')
+            a.delete_tab._add_term()
+            a.delete_tab.mode_var.set('column')
+            a.delete_tab._save_rule()
+            dprof = config_store.get_profile('delete', '测试记录')
+            assert dprof['mode'] == 'column', dprof
+            assert dprof['terms'] == [['作废', 'contains'], ['合计', 'equals']], dprof
+            assert dprof['case_sensitive'] is False, dprof
+            a.delete_tab._terms.clear()
+            a.delete_tab._refresh_terms()
+            a.delete_tab.rule_cb.set('测试记录')
+            a.delete_tab._load_rule()
+            assert a.delete_tab._terms == [('作废', 'contains'), ('合计', 'equals')], a.delete_tab._terms
+            assert a.delete_tab.mode_var.get() == 'column', a.delete_tab.mode_var.get()
+            print('  [删除规则] 保存/载入正确')
+
             # 删除（确认弹窗返回 True）
             appmod.messagebox.askyesno = lambda *a, **k: True
             a.rename_tab.rule_cb.set('测试记录')

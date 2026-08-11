@@ -123,6 +123,47 @@ class FilePicker(ttk.LabelFrame):
 
 
 # ---------------------------------------------------------------------------
+# 可滚动容器：内容超高时出现垂直滚动条，不靠扩大窗口
+# ---------------------------------------------------------------------------
+
+class ScrollableFrame(ttk.Frame):
+    """把内容放进 .inner，内容超出可视高度时自动出现滚动条。"""
+
+    def __init__(self, master):
+        super().__init__(master)
+        self._canvas = tk.Canvas(self, highlightthickness=0, borderwidth=0)
+        self._vsb = ttk.Scrollbar(self, orient='vertical', command=self._canvas.yview)
+        self._canvas.configure(yscrollcommand=self._vsb.set)
+        self._vsb.pack(side='right', fill='y')
+        self._canvas.pack(side='left', fill='both', expand=True)
+        self.inner = ttk.Frame(self._canvas)
+        self._window_id = self._canvas.create_window((0, 0), window=self.inner, anchor='nw')
+        self.inner.bind('<Configure>', self._on_inner_configure)
+        self._canvas.bind('<Configure>', self._on_canvas_configure)
+        self._canvas.bind('<Enter>', self._bind_mousewheel)
+        self._canvas.bind('<Leave>', self._unbind_mousewheel)
+
+    def _on_inner_configure(self, _event):
+        self._canvas.configure(scrollregion=self._canvas.bbox('all'))
+
+    def _on_canvas_configure(self, event):
+        self._canvas.itemconfigure(self._window_id, width=event.width)
+
+    def _bind_mousewheel(self, _event):
+        self._canvas.bind_all('<MouseWheel>', self._on_mousewheel)
+
+    def _unbind_mousewheel(self, _event):
+        self._canvas.unbind_all('<MouseWheel>')
+
+    def _on_mousewheel(self, event):
+        w = event.widget
+        # 自身带滚动条的控件（文本框/列表）交给它们自己处理，避免双重滚动
+        if w.winfo_class() in ('Text', 'Listbox', 'TCombobox', 'Treeview'):
+            return
+        self._canvas.yview_scroll(int(-event.delta / 120), 'units')
+
+
+# ---------------------------------------------------------------------------
 # 标签页基类：后台线程 + 队列轮询管道
 # ---------------------------------------------------------------------------
 
@@ -220,9 +261,9 @@ class BaseTab(ttk.Frame):
         self.log_text.see('end')
         self.log_text.configure(state='disabled')
 
-    def _build_log_area(self):
-        frame = ttk.LabelFrame(self, text='运行日志')
-        frame.pack(fill='both', expand=True, padx=8, pady=(4, 8))
+    def _build_log_area(self, parent):
+        frame = ttk.LabelFrame(parent, text='运行日志')
+        frame.pack(fill='x', padx=8, pady=(4, 8))
         self.log_text = ScrolledText(frame, height=7, state='disabled', wrap='word',
                                      font=('Microsoft YaHei UI', 9))
         self.log_text.pack(fill='both', expand=True, padx=4, pady=4)
@@ -256,13 +297,15 @@ class RenameTab(BaseTab):
         self._build()
 
     def _build(self):
+        body = ScrollableFrame(self)
+        body.pack(fill='both', expand=True)
         # ① 选择文件
-        picker = FilePicker(self, text='① 选择要处理的文件（.xlsx / .xlsm / .xls）')
+        picker = FilePicker(body.inner, text='① 选择要处理的文件（.xlsx / .xlsm / .xls）')
         picker.pack(fill='x', padx=8, pady=(8, 4))
         self.picker = picker
 
         # ② 重命名规则
-        rule = ttk.LabelFrame(self, text='② 重命名规则（单元格 / 手打文字 / 原文件名 按顺序拼接为文件名）')
+        rule = ttk.LabelFrame(body.inner, text='② 重命名规则（单元格 / 手打文字 / 原文件名，按顺序拼接为文件名）')
         rule.pack(fill='x', padx=8, pady=4)
 
         mid = ttk.Frame(rule)
@@ -330,7 +373,7 @@ class RenameTab(BaseTab):
         self._refresh_rule_combobox()
 
         # ③ 预览
-        prev = ttk.LabelFrame(self, text='③ 预览（先预览确认无误，再执行）')
+        prev = ttk.LabelFrame(body.inner, text='③ 预览（先预览确认无误，再执行）')
         prev.pack(fill='x', padx=8, pady=4)
         pframe = ttk.Frame(prev)
         pframe.pack(fill='x', padx=6, pady=(6, 2))
@@ -348,7 +391,7 @@ class RenameTab(BaseTab):
         self.preview_text.pack(side='left', fill='both', expand=True)
 
         # ④ 输出与执行
-        out = ttk.LabelFrame(self, text='④ 输出文件夹与执行')
+        out = ttk.LabelFrame(body.inner, text='④ 输出文件夹与执行')
         out.pack(fill='x', padx=8, pady=4)
         orow = ttk.Frame(out)
         orow.pack(fill='x', padx=6, pady=(6, 2))
@@ -364,7 +407,7 @@ class RenameTab(BaseTab):
         self.cancel_button = ttk.Button(brow, text='取消', command=self._cancel, state='disabled')
         self.cancel_button.pack(side='left', padx=4)
 
-        self._build_log_area()
+        self._build_log_area(self)
 
     # ---- 规则编辑 ----
     def _add_coord(self):
@@ -573,12 +616,14 @@ class FillTab(BaseTab):
         self._build()
 
     def _build(self):
+        body = ScrollableFrame(self)
+        body.pack(fill='both', expand=True)
         # ① 选择源文件 + 模板
-        picker = FilePicker(self, text='① 选择源文件（每个文件按第一个工作表读取数据）')
+        picker = FilePicker(body.inner, text='① 选择源文件（每个文件按第一个工作表读取数据）')
         picker.pack(fill='x', padx=8, pady=(8, 4))
         self.picker = picker
 
-        tpl = ttk.LabelFrame(self, text='② 选择模板文件')
+        tpl = ttk.LabelFrame(body.inner, text='② 选择模板文件')
         tpl.pack(fill='x', padx=8, pady=4)
         trow = ttk.Frame(tpl)
         trow.pack(fill='x', padx=6, pady=6)
@@ -588,76 +633,87 @@ class FillTab(BaseTab):
         ttk.Button(trow, text='选择模板…', command=self._pick_template).pack(side='left', padx=4)
 
         # ③ 映射表
-        map_frame = ttk.LabelFrame(self, text='③ 映射表（单元格 → 单元格 或 整列 → 整列，均指第一个工作表）')
+        map_frame = ttk.LabelFrame(body.inner, text='③ 映射表（单元格 → 单元格 或 整列 → 整列，均指第一个工作表）')
         map_frame.pack(fill='x', padx=8, pady=4)
 
+        # 映射表格行高加高，减少拥挤
+        _style = ttk.Style()
+        _style.configure('Map.Treeview', rowheight=26)
+
         tree_frame = ttk.Frame(map_frame)
-        tree_frame.pack(fill='x', padx=6, pady=(6, 2))
+        tree_frame.pack(fill='x', padx=8, pady=(8, 4))
         cols = ('type', 'src', 'tpl')
-        self.tree = ttk.Treeview(tree_frame, columns=cols, show='headings', height=4)
+        self.tree = ttk.Treeview(tree_frame, columns=cols, show='headings', height=4, style='Map.Treeview')
         self.tree.heading('type', text='类型')
         self.tree.heading('src', text='源')
         self.tree.heading('tpl', text='模板')
-        self.tree.column('type', width=70, anchor='center')
-        self.tree.column('src', width=160, anchor='center')
-        self.tree.column('tpl', width=160, anchor='center')
+        self.tree.column('type', width=80, anchor='center')
+        self.tree.column('src', width=170, anchor='center')
+        self.tree.column('tpl', width=170, anchor='center')
         tsb = ttk.Scrollbar(tree_frame, orient='vertical', command=self.tree.yview)
         self.tree.configure(yscrollcommand=tsb.set)
         tsb.pack(side='right', fill='y')
         self.tree.pack(side='left', fill='both', expand=True)
 
         edit = ttk.Frame(map_frame)
-        edit.pack(fill='x', padx=6, pady=(4, 2))
+        edit.pack(fill='x', padx=8, pady=(2, 2))
 
+        # 第一行：类型 + 输入（间距宽松）
         row1 = ttk.Frame(edit)
-        row1.pack(fill='x')
+        row1.pack(fill='x', pady=(6, 6))
+        ttk.Label(row1, text='添加方式：').pack(side='left')
         self.map_type = ttk.Combobox(row1, state='readonly', width=13,
                                      values=['单元格 → 单元格', '整列 → 整列'])
         self.map_type.set('单元格 → 单元格')
         self.map_type.bind('<<ComboboxSelected>>', lambda e: self._toggle_map_type())
-        self.map_type.pack(side='left')
+        self.map_type.pack(side='left', padx=(6, 0))
 
         self.input_frame = ttk.Frame(row1)
-        self.input_frame.pack(side='left', padx=(8, 0))
+        self.input_frame.pack(side='left', padx=(18, 0))
 
         # 单元格模式
         self.cell_frame = ttk.Frame(self.input_frame)
         self.cell_frame.pack(side='left')
         ttk.Label(self.cell_frame, text='源单元格：').pack(side='left')
         self.src_entry = ttk.Entry(self.cell_frame, width=8)
-        self.src_entry.pack(side='left')
-        ttk.Label(self.cell_frame, text=' 模板单元格：').pack(side='left', padx=(6, 0))
+        self.src_entry.pack(side='left', padx=(2, 0))
+        ttk.Label(self.cell_frame, text=' 模板单元格：').pack(side='left', padx=(8, 0))
         self.tpl_entry = ttk.Entry(self.cell_frame, width=8)
-        self.tpl_entry.pack(side='left')
+        self.tpl_entry.pack(side='left', padx=(2, 0))
 
         # 整列模式
         self.col_frame = ttk.Frame(self.input_frame)
         ttk.Label(self.col_frame, text='源列：').pack(side='left')
         self.src_col_entry = ttk.Entry(self.col_frame, width=5)
-        self.src_col_entry.pack(side='left')
-        ttk.Label(self.col_frame, text='从第').pack(side='left')
+        self.src_col_entry.pack(side='left', padx=(2, 0))
+        ttk.Label(self.col_frame, text='从第').pack(side='left', padx=(4, 0))
         self.src_row_entry = ttk.Entry(self.col_frame, width=4)
-        self.src_row_entry.pack(side='left')
-        ttk.Label(self.col_frame, text='行  → 模板列：').pack(side='left', padx=(4, 0))
+        self.src_row_entry.pack(side='left', padx=(2, 0))
+        ttk.Label(self.col_frame, text='行  → 模板列：').pack(side='left', padx=(6, 0))
         self.tpl_col_entry = ttk.Entry(self.col_frame, width=5)
-        self.tpl_col_entry.pack(side='left')
-        ttk.Label(self.col_frame, text='从第').pack(side='left')
+        self.tpl_col_entry.pack(side='left', padx=(2, 0))
+        ttk.Label(self.col_frame, text='从第').pack(side='left', padx=(4, 0))
         self.tpl_row_entry = ttk.Entry(self.col_frame, width=4)
-        self.tpl_row_entry.pack(side='left')
-        ttk.Label(self.col_frame, text='行').pack(side='left')
+        self.tpl_row_entry.pack(side='left', padx=(2, 0))
+        ttk.Label(self.col_frame, text='行').pack(side='left', padx=(2, 0))
 
+        # 第二行：操作按钮（独占一行，间距宽松）
         row2 = ttk.Frame(edit)
-        row2.pack(fill='x', pady=(4, 4))
-        ttk.Button(row2, text='添加', width=6, command=self._add_map).pack(side='left')
-        ttk.Button(row2, text='删除', width=6, command=self._del_map).pack(side='left', padx=2)
-        ttk.Button(row2, text='上移', width=6, command=lambda: self._move_map(-1)).pack(side='left', padx=2)
-        ttk.Button(row2, text='下移', width=6, command=lambda: self._move_map(1)).pack(side='left', padx=2)
-        ttk.Label(row2, text='整列：源列从起始行向下读到空单元格为止；目标已有内容时插入空白行，不覆盖。',
-                  foreground='#57606a').pack(side='left', padx=(10, 0))
+        row2.pack(fill='x', pady=(6, 4))
+        ttk.Button(row2, text='添加', width=6, command=self._add_map).pack(side='left', padx=(0, 6))
+        ttk.Button(row2, text='删除', width=6, command=self._del_map).pack(side='left', padx=6)
+        ttk.Button(row2, text='上移', width=6, command=lambda: self._move_map(-1)).pack(side='left', padx=6)
+        ttk.Button(row2, text='下移', width=6, command=lambda: self._move_map(1)).pack(side='left', padx=6)
+
+        # 第三行：说明（单独一行）
+        row3 = ttk.Frame(edit)
+        row3.pack(fill='x', pady=(2, 6))
+        ttk.Label(row3, text='说明：整列 = 源列从起始行向下读到空单元格为止；目标已有内容时插入空白行，不覆盖。',
+                  foreground='#57606a').pack(anchor='w')
 
         # 映射保存/载入
         profile_row = ttk.Frame(map_frame)
-        profile_row.pack(fill='x', padx=6, pady=(2, 6))
+        profile_row.pack(fill='x', padx=8, pady=(4, 8))
         ttk.Button(profile_row, text='保存当前映射…', command=self._save_mapping).pack(side='left')
         ttk.Label(profile_row, text='  已保存映射：').pack(side='left', padx=(8, 2))
         self.map_cb = ttk.Combobox(profile_row, state='readonly', width=18)
@@ -667,7 +723,7 @@ class FillTab(BaseTab):
         self._refresh_map_combobox()
 
         # ④ 预览
-        prev = ttk.LabelFrame(self, text='④ 预览（输出文件名 = 模板名 + 源文件名）')
+        prev = ttk.LabelFrame(body.inner, text='④ 预览（输出文件名 = 模板名 + 源文件名）')
         prev.pack(fill='x', padx=8, pady=4)
         pframe = ttk.Frame(prev)
         pframe.pack(fill='x', padx=6, pady=(6, 2))
@@ -685,7 +741,7 @@ class FillTab(BaseTab):
         self.preview_text.pack(side='left', fill='both', expand=True)
 
         # ⑤ 输出与执行
-        out = ttk.LabelFrame(self, text='⑤ 输出文件夹与执行')
+        out = ttk.LabelFrame(body.inner, text='⑤ 输出文件夹与执行')
         out.pack(fill='x', padx=8, pady=4)
         orow = ttk.Frame(out)
         orow.pack(fill='x', padx=6, pady=(6, 2))
@@ -701,7 +757,7 @@ class FillTab(BaseTab):
         self.cancel_button = ttk.Button(brow, text='取消', command=self._cancel, state='disabled')
         self.cancel_button.pack(side='left', padx=4)
 
-        self._build_log_area()
+        self._build_log_area(self)
 
     # ---- 映射编辑 ----
     def _pick_template(self):
@@ -942,13 +998,15 @@ class DeleteTab(BaseTab):
         self._build()
 
     def _build(self):
+        body = ScrollableFrame(self)
+        body.pack(fill='both', expand=True)
         # ① 选择文件
-        picker = FilePicker(self, text='① 选择要处理的文件（.xlsx / .xlsm / .xls）')
+        picker = FilePicker(body.inner, text='① 选择要处理的文件（.xlsx / .xlsm / .xls）')
         picker.pack(fill='x', padx=8, pady=(8, 4))
         self.picker = picker
 
         # ② 删除设置
-        cfg = ttk.LabelFrame(self, text='② 删除设置（删除整行/整列中任意单元格匹配条件的行/列）')
+        cfg = ttk.LabelFrame(body.inner, text='② 删除设置（删除整行/整列中任意单元格匹配条件的行/列）')
         cfg.pack(fill='x', padx=8, pady=4)
 
         row1 = ttk.Frame(cfg)
@@ -992,12 +1050,23 @@ class DeleteTab(BaseTab):
         ttk.Button(btn_col, text='下移', width=8, command=lambda: self._move_term(1)).pack(pady=1)
 
         row3 = ttk.Frame(cfg)
-        row3.pack(fill='x', padx=6, pady=(2, 6))
+        row3.pack(fill='x', padx=6, pady=(2, 2))
         ttk.Label(row3, text='说明：如添加"作废(包含)"和"计算(等于)"，则任一单元格含"作废"或等于"计算"的行都会被删除。',
                   foreground='#57606a').pack(anchor='w')
 
+        # 规则保存/载入
+        profile_row = ttk.Frame(cfg)
+        profile_row.pack(fill='x', padx=6, pady=(2, 6))
+        ttk.Button(profile_row, text='保存当前规则…', command=self._save_rule).pack(side='left')
+        ttk.Label(profile_row, text='  已保存规则：').pack(side='left', padx=(8, 2))
+        self.rule_cb = ttk.Combobox(profile_row, state='readonly', width=18)
+        self.rule_cb.pack(side='left')
+        ttk.Button(profile_row, text='载入', command=self._load_rule).pack(side='left', padx=2)
+        ttk.Button(profile_row, text='删除', command=self._delete_rule).pack(side='left', padx=2)
+        self._refresh_rule_combobox()
+
         # ③ 预览
-        prev = ttk.LabelFrame(self, text='③ 预览（统计每个文件将删除的行/列数）')
+        prev = ttk.LabelFrame(body.inner, text='③ 预览（统计每个文件将删除的行/列数）')
         prev.pack(fill='x', padx=8, pady=4)
         pframe = ttk.Frame(prev)
         pframe.pack(fill='x', padx=6, pady=(6, 2))
@@ -1015,7 +1084,7 @@ class DeleteTab(BaseTab):
         self.preview_text.pack(side='left', fill='both', expand=True)
 
         # ④ 输出与执行
-        out = ttk.LabelFrame(self, text='④ 输出文件夹与执行（原文件保留不动，删除结果输出到新文件夹）')
+        out = ttk.LabelFrame(body.inner, text='④ 输出文件夹与执行（原文件保留不动，删除结果输出到新文件夹）')
         out.pack(fill='x', padx=8, pady=4)
         orow = ttk.Frame(out)
         orow.pack(fill='x', padx=6, pady=(6, 2))
@@ -1031,7 +1100,7 @@ class DeleteTab(BaseTab):
         self.cancel_button = ttk.Button(brow, text='取消', command=self._cancel, state='disabled')
         self.cancel_button.pack(side='left', padx=4)
 
-        self._build_log_area()
+        self._build_log_area(self)
 
     # ---- 条件编辑 ----
     def _add_term(self):
@@ -1069,6 +1138,64 @@ class DeleteTab(BaseTab):
         self.terms_list.delete(0, 'end')
         for v, m in self._terms:
             self.terms_list.insert('end', f'{v}（{"包含" if m == "contains" else "等于"}）')
+
+    # ---- 规则保存/载入 ----
+    def _save_rule(self):
+        if not self._terms:
+            messagebox.showwarning('提示', '请先添加至少一条查找条件再保存', parent=self)
+            return
+        name = simpledialog.askstring('保存规则', '请输入规则名称（留空则用时间命名）：', parent=self)
+        if name is None:
+            return
+        name = name.strip() or time.strftime('%m-%d %H:%M')
+        if name in config_store.list_profiles('delete'):
+            if not messagebox.askyesno('提示', f'规则「{name}」已存在，是否覆盖？', parent=self):
+                return
+        config_store.save_profile('delete', name, {
+            'mode': self.mode_var.get(),
+            'terms': [list(t) for t in self._terms],
+            'case_sensitive': bool(self.case_var.get()),
+        })
+        self._refresh_rule_combobox(name)
+        self._append_log(f'[提示] 删除规则「{name}」已保存')
+
+    def _load_rule(self):
+        name = self.rule_cb.get()
+        if not name:
+            messagebox.showinfo('提示', '请先在列表中选择要载入的规则', parent=self)
+            return
+        prof = config_store.get_profile('delete', name)
+        if not prof:
+            messagebox.showwarning('提示', f'规则「{name}」不存在', parent=self)
+            return
+        self.mode_var.set(prof.get('mode', 'row'))
+        self._terms = []
+        for t in prof.get('terms', []):
+            if len(t) == 2:
+                self._terms.append((str(t[0]), t[1] if t[1] in ('contains', 'equals') else 'contains'))
+        self._refresh_terms()
+        self.case_var.set(bool(prof.get('case_sensitive', False)))
+        self._append_log(f'[提示] 已载入删除规则「{name}」')
+
+    def _delete_rule(self):
+        name = self.rule_cb.get()
+        if not name:
+            return
+        if not messagebox.askyesno('删除规则', f'确定删除规则「{name}」吗？', parent=self):
+            return
+        config_store.delete_profile('delete', name)
+        self._refresh_rule_combobox()
+        self._append_log(f'[提示] 已删除规则「{name}」')
+
+    def _refresh_rule_combobox(self, select=None):
+        names = config_store.list_profiles('delete')
+        self.rule_cb['values'] = names
+        if select and select in names:
+            self.rule_cb.set(select)
+        elif self.rule_cb.get() not in names and names:
+            self.rule_cb.set(names[0])
+        elif not names:
+            self.rule_cb.set('')
 
     # ---- 交互 ----
     def _pick_outdir(self):
@@ -1162,8 +1289,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title('Excel 批量处理工具')
-        self.geometry('880x700')
-        self.minsize(780, 600)
+        self.geometry('900x740')
+        self.minsize(800, 620)
 
         for name in ('TkDefaultFont', 'TkTextFont', 'TkMenuFont'):
             try:
