@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+
+# PyInstaller 构建产物
+build/
+dist/
+*.spec
+
+# 测试输出
+test_out*/
+exp*.xls
+m_test.xlsx
+
+# 运行时数据（用户保存的规则，不入库）
+ExcelBatchTool_profiles.json
+ExcelBatchTool_错误日志.txt

@@ -1,0 +1,514 @@
+"""核心逻辑自动化测试（开发用）。
+
+用法：python test_core.py
+"""
+
+import shutil
+import sys
+from pathlib import Path
+
+import excel_core
+
+BASE = Path(__file__).parent
+SAMPLES = BASE / 'test_samples'
+OUT = BASE / 'test_out'
+
+
+def log(msg):
+    print(msg)
+
+
+def check(cond, name):
+    print(('PASS' if cond else 'FAIL') + ' | ' + name)
+    if not cond:
+        sys.exit(1)
+
+
+def clean_out():
+    if OUT.exists():
+        shutil.rmtree(OUT)
+    OUT.mkdir()
+
+
+def test_rename():
+    clean_out()
+    files = [str(SAMPLES / f) for f in ('数据1.xlsx', '数据2.xlsx', '数据3.xlsx',
+                                        '数据4.xlsx', '数据5.xlsx', '数据6.xlsx', '数据7.xlsx')]
+    rule = [('cell', 'A1'), ('cell', 'B2'), ('cell', 'C3')]
+    plan, errors = excel_core.plan_rename(files, rule, '-', OUT)
+    print('--- 重命名计划 ---')
+    names = [p.name for p in plan]
+    for p in plan:
+        print(f'  {p.src.name} -> {p.name}')
+    check(not errors, '无读取错误')
+
+    expect = {
+        '数据1': '张三-20240115-98.5.xlsx',
+        '数据2': '李四-20240220-100.xlsx',
+        '数据3': '李四-20240220-100 (1).xlsx',      # 重名去重
+        '数据4': '王五_Q_A-20240301-7.xlsx',        # 非法字符替换
+        '数据6': '赵六-7.xlsx',                     # 空值跳过
+        # 数据7：'CON-20240501-9' 整体并非保留名，Windows 允许，故不加前缀
+        '数据7': 'CON-20240501-9.xlsx',
+    }
+    for p in plan:
+        stem = p.src.stem
+        if stem in expect:
+            check(p.name == expect[stem], f'{stem} 新文件名 {p.name} == {expect[stem]}')
+    # 数据5 超长截断到 150
+    d5 = next(p for p in plan if p.src.stem == '数据5')
+    check(d5.name == '很' * 150 + '.xlsx', f'超长截断到 150 字符（实际 {len(Path(d5.name).stem)}）')
+
+    # 纯保留设备名（单单元格）应加下划线前缀
+    check(excel_core.sanitize_name_part('CON') == '_CON', '保留名 CON 前缀下划线')
+    check(excel_core.sanitize_name_part('CON.txt') == '_CON.txt', '保留名带扩展名前缀下划线')
+
+    # 执行
+    summary = excel_core.execute_rename(plan, log)
+    print('--- 执行结果 ---', summary)
+    check(summary['ok'] == 7, '7 个文件全部成功')
+    check(all(p.dst.exists() for p in plan), '所有输出文件已生成')
+    check(not (SAMPLES / '数据1.xlsx' in [p.dst for p in plan]), '原文件未被覆盖')
+
+    # 二次执行应触发磁盘重名检测（已存在的基础名/序号名会被递增跳过）
+    plan2, _ = excel_core.plan_rename(files, rule, '-', OUT)
+    names2 = {p.name for p in plan2}
+    check(len(names2) == len(plan2), '二次计划文件名全部唯一')
+    check(all(' (' in p.name for p in plan2
+              if p.src.stem in ('数据1', '数据2', '数据3', '数据4', '数据6', '数据7')),
+          '磁盘已存在时自动追加序号')
+
+
+def test_rename_advanced():
+    """自由组合规则：手打文字 / 单元格 / 原文件名 混排。"""
+    out = BASE / 'test_out_adv'
+    if out.exists():
+        shutil.rmtree(out)
+    out.mkdir()
+
+    # 1) 文字 + 单元格 + 原文件名 混排，分隔符插在相邻 data 之间
+    files = [str(SAMPLES / '数据1.xlsx')]   # A1=张三, B2=2024-01-15
+    rule = [('text', '客户_'), ('cell', 'A1'), ('filename', ''), ('text', '_已审')]
+    plan, errors = excel_core.plan_rename(files, rule, '-', out)
+    check(not errors, '高级规则无读取错误')
+    check(plan[0].name == '客户_张三-数据1_已审.xlsx', f'混排规则 {plan[0].name}')
+
+    # 2) 文字与单元格相邻时，不插分隔符；单元格之间才插
+    rule2 = [('text', '客户'), ('cell', 'A1'), ('cell', 'B2')]
+    plan, _ = excel_core.plan_rename(files, rule2, '-', out)
+    check(plan[0].name == '客户张三-20240115.xlsx', f'文字相邻不插分隔符 {plan[0].name}')
+
+    # 3) 单元格全空时回退原文件名，文字仍保留
+    empty = out / '空白.xlsx'
+    from openpyxl import Workbook
+    wb = Workbook()
+    wb.save(empty)
+    rule3 = [('text', '前缀'), ('cell', 'A1'), ('text', '后缀')]
+    plan, _ = excel_core.plan_rename([str(empty)], rule3, '-', out)
+    check(plan[0].name == '前缀后缀.xlsx', f'空单元格回退原文件名+文字 {plan[0].name}')
+
+
+def test_fill():
+    clean_out()
+    template = str(SAMPLES / '合同模板.xlsx')
+    files = [str(SAMPLES / f) for f in ('数据1.xlsx', '数据2.xlsx')]
+    mapping = [('cell', 'A1', 'B2'), ('cell', 'B2', 'C5'), ('cell', 'C3', 'D6')]
+    plan, errors = excel_core.plan_fill(files, template, mapping, OUT)
+    print('--- 填充计划 ---')
+    for p in plan:
+        print(f'  {p.src.name} -> {p.dst.name}')
+    check(not errors, '无读取错误')
+    check(plan[0].dst.name == '合同模板_数据1.xlsx', '输出文件名 = 模板名 + 源文件名')
+
+    summary = excel_core.execute_fill(template, plan, mapping, log)
+    print('--- 填充结果 ---', summary)
+    check(summary['ok'] == 2, '2 个文件全部成功')
+    check(all(p.dst.exists() for p in plan), '所有输出文件已生成')
+
+    # 验证内容与格式
+    from openpyxl import load_workbook
+    wb = load_workbook(plan[0].dst)
+    ws = wb.worksheets[0]
+    check(ws['B2'].value == '张三', '模板 B2 填入源 A1（张三）')
+    from datetime import datetime
+    check(ws['C5'].value == datetime(2024, 1, 15), '模板 C5 填入日期（保持日期类型）')
+    check(ws['D6'].value == 98.5, '模板 D6 填入数值（保持数值类型）')
+    check(ws['B2'].number_format == '0.00', '模板 B2 数字格式保留')
+    check(ws['C5'].number_format == 'yyyy-mm-dd', '模板 C5 日期格式保留')
+    check(ws['A1'].font.bold, '模板标题加粗保留')
+    check(ws['A1'].value == '合同信息表', '模板其他内容未受影响')
+    wb.close()
+
+    # 映射验证：数据2 的日期写入 C5
+    wb2 = load_workbook(plan[1].dst)
+    ws2 = wb2.worksheets[0]
+    check(ws2['C5'].value == datetime(2024, 2, 20), '数据2 日期正确')
+    wb2.close()
+
+
+def test_fill_column():
+    """整列映射：源列数据填入模板列；目标已有内容时插入空白行下移，不覆盖。"""
+    from openpyxl import Workbook, load_workbook
+    clean_out()
+
+    # 源文件：B 列 2..6 行 = 产品A..产品E，第 7 行为空（列到此为止）
+    src = OUT / '列源.xlsx'
+    wb = Workbook()
+    ws = wb.active
+    for r, v in enumerate(['产品A', '产品B', '产品C', '产品D', '产品E'], start=2):
+        ws[f'B{r}'] = v
+    wb.save(src)
+
+    # 模板：C 列 5..7 行已有内容
+    tpl = OUT / '列模板.xlsx'
+    wb = Workbook()
+    ws = wb.active
+    for r, v in zip((5, 6, 7), ('已有1', '已有2', '已有3')):
+        ws[f'C{r}'] = v
+    wb.save(tpl)
+
+    mapping = [('column', 'B', 2, 'C', 5)]
+    plan, errors = excel_core.plan_fill([str(src)], str(tpl), mapping, OUT)
+    check(not errors, '整列映射无读取错误')
+    summary = excel_core.execute_fill(str(tpl), plan, mapping, log)
+    check(summary['ok'] == 1, '整列填充成功')
+
+    out_wb = load_workbook(plan[0].dst)
+    ws = out_wb.worksheets[0]
+    for r, v in enumerate(['产品A', '产品B', '产品C', '产品D', '产品E'], start=5):
+        check(ws[f'C{r}'].value == v, f'C{r} 填入 {v}')
+    check(ws['C10'].value == '已有1', '原有内容1 下移不覆盖')
+    check(ws['C11'].value == '已有2', '原有内容2 下移不覆盖')
+    check(ws['C12'].value == '已有3', '原有内容3 下移不覆盖')
+    out_wb.close()
+
+    # 无冲突情况：模板列为空，直接填充，不插入多余行
+    tpl2 = OUT / '列模板2.xlsx'
+    wb = Workbook()
+    wb.save(tpl2)
+    plan2, _ = excel_core.plan_fill([str(src)], str(tpl2), mapping, OUT)
+    excel_core.execute_fill(str(tpl2), plan2, mapping, log)
+    ws2 = load_workbook(plan2[0].dst).worksheets[0]
+    check(ws2['C5'].value == '产品A' and ws2['C9'].value == '产品E', '无冲突时直接填充')
+    check(ws2['C10'].value is None, '无冲突时不插入多余行')
+
+
+def test_fill_column_row_boundary():
+    """列填充扩展：源数据超出空白时在目标列边界处插入，且不影响其他列数据对齐。"""
+    from openpyxl import Workbook as WX, load_workbook as LW
+    clean_out()
+
+    # 源：B 列 5..9 = 产品A..E
+    src = OUT / 's.xlsx'
+    wb = WX()
+    ws = wb.active
+    for r, v in enumerate(['产品A', '产品B', '产品C', '产品D', '产品E'], start=5):
+        ws[f'B{r}'] = v
+    wb.save(src)
+
+    # --- .xlsx：填 B 列起始行2；B2-B4 空白，B5=100(目标列边界)；A 列有序号 1,2,3 和合计 ---
+    tpl = OUT / 't.xlsx'
+    wb = WX()
+    ws = wb.active
+    ws['A1'] = '序号'
+    ws['B1'] = '金额'
+    ws['A2'] = 1
+    ws['A3'] = 2
+    ws['A4'] = 3
+    ws['A5'] = '合计'
+    ws['B5'] = 100
+    wb.save(tpl)
+    mapping = [('column', 'B', 5, 'B', 2)]
+    plan, _ = excel_core.plan_fill([str(src)], str(tpl), mapping, OUT)
+    summary = excel_core.execute_fill(str(tpl), plan, mapping, log)
+    check(summary['ok'] == 1, 'xlsx 列扩展填充成功')
+    ws2 = LW(plan[0].dst).worksheets[0]
+    check(ws2['B2'].value == '产品A' and ws2['B6'].value == '产品E', 'xlsx B2-B6 填满源列')
+    check(ws2['B7'].value == 100, 'xlsx 边界值推下到 B7')
+    check(ws2['A7'].value == '合计', 'xlsx 合计随边界下移')
+    check(ws2['A2'].value == 1 and ws2['A3'].value == 2 and ws2['A4'].value == 3,
+          'xlsx 其他列(序号)保持对齐不被推下')
+
+    # --- .xls：同样场景 ---
+    import xlwt
+    tpl_x = OUT / 't.xls'
+    wb = xlwt.Workbook()
+    ws = wb.add_sheet('S')
+    ws.write(0, 0, '序号')
+    ws.write(0, 1, '金额')
+    ws.write(1, 0, 1)
+    ws.write(2, 0, 2)
+    ws.write(3, 0, 3)
+    ws.write(4, 0, '合计')
+    ws.write(4, 1, 100)   # 0基第4行：B5=100，目标列边界
+    wb.save(str(tpl_x))
+    plan, _ = excel_core.plan_fill([str(src)], str(tpl_x), mapping, OUT)
+    summary = excel_core.execute_fill(str(tpl_x), plan, mapping, log)
+    check(summary['ok'] == 1, 'xls 列扩展填充成功')
+    import xlrd
+    s = xlrd.open_workbook(str(plan[0].dst)).sheet_by_index(0)
+    check(s.cell_value(1, 1) == '产品A' and s.cell_value(5, 1) == '产品E', 'xls B2-B6 填满源列')
+    check(s.cell_value(6, 1) == 100, 'xls 边界值推下到第7行(0基6)')
+    check(s.cell_value(6, 0) == '合计', 'xls 合计随边界下移')
+    check(s.cell_value(1, 0) == 1 and s.cell_value(2, 0) == 2 and s.cell_value(3, 0) == 3,
+          'xls 其他列(序号)保持对齐')
+
+
+def test_fill_column_merged():
+    """列填充不得覆盖模板原有数据或合并单元格：合并区视为边界，随插入整体下移。"""
+    from openpyxl import Workbook as WX, load_workbook as LW
+    clean_out()
+
+    # 源：B 列 5..8 = 产品A..D
+    src = OUT / 's.xlsx'
+    wb = WX()
+    ws = wb.active
+    for r, v in enumerate(['产品A', '产品B', '产品C', '产品D'], start=5):
+        ws[f'B{r}'] = v
+    wb.save(src)
+
+    # --- .xlsx：目标列 B2:B3 合并('原有合并')，B6='边界内容' ---
+    tpl = OUT / 't.xlsx'
+    wb = WX()
+    ws = wb.active
+    ws.merge_cells('B2:B3')
+    ws['B2'] = '原有合并'
+    ws['B6'] = '边界内容'
+    wb.save(tpl)
+    mapping = [('column', 'B', 5, 'B', 2)]
+    plan, _ = excel_core.plan_fill([str(src)], str(tpl), mapping, OUT)
+    summary = excel_core.execute_fill(str(tpl), plan, mapping, log)
+    check(summary['ok'] == 1, 'xlsx 合并单元格列填充成功')
+    ws2 = LW(plan[0].dst).worksheets[0]
+    check(ws2['B2'].value == '产品A' and ws2['B5'].value == '产品D', 'xlsx 源列填满不丢失')
+    check(ws2['B6'].value == '原有合并', 'xlsx 合并内容未被覆盖')
+    ranges = [str(r) for r in ws2.merged_cells.ranges]
+    check('B6:B7' in ranges, f'xlsx 合并区域随插入下移 ({ranges})')
+    check(ws2['B10'].value == '边界内容', 'xlsx 边界内容下移不覆盖')
+
+    # --- .xls：同样场景 ---
+    import xlwt
+    tpl_x = OUT / 't.xls'
+    wb = xlwt.Workbook()
+    ws = wb.add_sheet('S')
+    ws.write_merge(1, 2, 1, 1, '原有合并')   # B2:B3
+    ws.write(5, 1, '边界内容')                # B6
+    wb.save(str(tpl_x))
+    plan, _ = excel_core.plan_fill([str(src)], str(tpl_x), mapping, OUT)
+    summary = excel_core.execute_fill(str(tpl_x), plan, mapping, log)
+    check(summary['ok'] == 1, 'xls 合并单元格列填充成功')
+    import xlrd
+    s = xlrd.open_workbook(str(plan[0].dst), formatting_info=True).sheet_by_index(0)
+    check(s.cell_value(1, 1) == '产品A' and s.cell_value(4, 1) == '产品D', 'xls 源列填满不丢失')
+    check(s.cell_value(5, 1) == '原有合并', 'xls 合并内容未被覆盖')
+    check((5, 7, 1, 2) in [tuple(m) for m in s.merged_cells], 'xls 合并区域随插入下移')
+    check(s.cell_value(9, 1) == '边界内容', 'xls 边界内容下移不覆盖')
+
+
+def test_xls():
+    """旧版 .xls 支持：重命名读取、.xls 源填充、.xls 模板重建填充（含插入行）。"""
+    import xlrd
+    import xlwt
+    from datetime import datetime
+    from openpyxl import Workbook, load_workbook
+    clean_out()
+
+    # --- 创建 .xls 源：A1=张三, B2=日期, C3=98.5；B 列 5..7 行=产品A..C ---
+    src_xls = OUT / '旧数据.xls'
+    wb = xlwt.Workbook()
+    ws = wb.add_sheet('Sheet1')
+    ws.write(0, 0, '张三')
+    date_style = xlwt.easyxf('', num_format_str='YYYY-MM-DD')
+    ws.write(1, 1, datetime(2024, 1, 15), date_style)
+    ws.write(2, 2, 98.5)
+    for r, v in enumerate(['产品A', '产品B', '产品C'], start=4):
+        ws.write(r, 1, v)
+    wb.save(str(src_xls))
+
+    # --- 1) .xls 重命名 ---
+    plan, errors = excel_core.plan_rename([str(src_xls)],
+                                          [('cell', 'A1'), ('cell', 'B2'), ('cell', 'C3')], '-', OUT)
+    check(not errors, 'xls 重命名无读取错误')
+    check(plan[0].name == '张三-20240115-98.5.xls', f'xls 重命名 {plan[0].name}')
+
+    # 规则引用超出范围的单元格：视为空，不应报 list index out of range
+    plan, errors = excel_core.plan_rename([str(src_xls)], [('cell', 'A1'), ('cell', 'Z99')], '-', OUT)
+    check(not errors, 'xls 越界读取不报错')
+    check(plan[0].name == '张三.xls', f'xls 越界视为空 {plan[0].name}')
+
+    # .xls 源整列读取（B 列 5..7 行），数据读到工作表边界不报错
+    mapping4 = [('column', 'B', 5, 'D', 2)]
+    tpl4 = str(SAMPLES / '合同模板.xlsx')
+    plan4, _ = excel_core.plan_fill([str(src_xls)], tpl4, mapping4, OUT)
+    summary4 = excel_core.execute_fill(tpl4, plan4, mapping4, log)
+    check(summary4['ok'] == 1, 'xls 源整列填充成功')
+    ws4 = load_workbook(plan4[0].dst).worksheets[0]
+    check(ws4['D2'].value == '产品A' and ws4['D4'].value == '产品C', 'xls 源整列值正确')
+
+    # --- 2) .xls 源 → .xlsx 模板（单元格映射） ---
+    tpl = str(SAMPLES / '合同模板.xlsx')
+    mapping = [('cell', 'A1', 'B2'), ('cell', 'B2', 'C5'), ('cell', 'C3', 'D6')]
+    plan, _ = excel_core.plan_fill([str(src_xls)], tpl, mapping, OUT)
+    summary = excel_core.execute_fill(tpl, plan, mapping, log)
+    check(summary['ok'] == 1, 'xls 源→xlsx 模板填充成功')
+    ws = load_workbook(plan[0].dst).worksheets[0]
+    check(ws['B2'].value == '张三', 'xls 源 A1 填入模板 B2')
+    check(ws['C5'].value == datetime(2024, 1, 15), 'xls 源 B2 日期填入模板 C5')
+    check(ws['D6'].value == 98.5, 'xls 源 C3 数值填入模板 D6')
+
+    # --- 3) .xls 源 → .xls 模板（单元格映射，格式保留） ---
+    tpl_xls = OUT / '旧模板.xls'
+    wb = xlwt.Workbook()
+    ws = wb.add_sheet('Sheet1')
+    border = xlwt.easyxf('borders: left thin, right thin, top thin, bottom thin')
+    ws.write(1, 1, None, border)                       # B2 带边框
+    ws.write(4, 2, None, date_style)                   # C5 日期格式
+    wb.save(str(tpl_xls))
+    mapping2 = [('cell', 'A1', 'B2'), ('cell', 'B2', 'C5')]
+    plan2, _ = excel_core.plan_fill([str(src_xls)], str(tpl_xls), mapping2, OUT)
+    summary2 = excel_core.execute_fill(str(tpl_xls), plan2, mapping2, log)
+    check(summary2['ok'] == 1, 'xls→xls 模板填充成功')
+    rb = xlrd.open_workbook(str(plan2[0].dst), formatting_info=True)
+    s = rb.sheet_by_index(0)
+    check(s.cell_value(1, 1) == '张三', 'xls 模板 B2 填入张三')
+    xf_b2 = rb.xf_list[s.cell_xf_index(1, 1)]
+    check(xf_b2.border.left_line_style == 1, 'xls 模板 B2 边框保留')
+    date_val = xlrd.xldate.xldate_as_datetime(s.cell_value(4, 2), rb.datemode)
+    check(date_val == datetime(2024, 1, 15), 'xls 模板 C5 日期保留')
+    rb.release_resources()
+
+    # --- 4) .xls 模板 整列填充（插入空白行下移，不覆盖） ---
+    tpl_xls2 = OUT / '旧表格模板.xls'
+    wb = xlwt.Workbook()
+    ws = wb.add_sheet('Sheet1')
+    for r, v in zip((4, 5, 6), ('产品', '旧项1', '旧项2')):
+        ws.write(r, 0, v, border)   # A5/A6/A7
+    wb.save(str(tpl_xls2))
+    mapping3 = [('column', 'B', 2, 'A', 6)]
+    plan3, _ = excel_core.plan_fill([str(SAMPLES / '列数据源.xlsx')], str(tpl_xls2), mapping3, OUT)
+    summary3 = excel_core.execute_fill(str(tpl_xls2), plan3, mapping3, log)
+    check(summary3['ok'] == 1, 'xls 模板整列填充成功')
+    s3 = xlrd.open_workbook(str(plan3[0].dst)).sheet_by_index(0)
+    check(s3.cell_value(5, 0) == '产品A', 'xls 模板 A6 填入产品A')
+    check(s3.cell_value(9, 0) == '产品E', 'xls 模板 A10 填入产品E')
+    check(s3.cell_value(10, 0) == '旧项1', 'xls 模板 旧项1 下移不覆盖')
+    check(s3.cell_value(11, 0) == '旧项2', 'xls 模板 旧项2 下移不覆盖')
+
+    # --- 5) .xls 模板含合并单元格标题：填充不应报 overwrite cell 错 ---
+    tpl_m = OUT / '对账模板.xls'
+    wb = xlwt.Workbook()
+    ws = wb.add_sheet('对账单模板')
+    header = xlwt.easyxf('font: bold on; borders: left thin, right thin, top thin, bottom thin; align: horiz center')
+    ws.write_merge(0, 0, 0, 3, '对账单', header)   # A1:D1 合并标题
+    ws.write(2, 1, None, border)                   # B3 待填
+    wb.save(str(tpl_m))
+    mapping_m = [('cell', 'A1', 'B3')]
+    plan_m, _ = excel_core.plan_fill([str(SAMPLES / '数据1.xlsx')], str(tpl_m), mapping_m, OUT)
+    summary_m = excel_core.execute_fill(str(tpl_m), plan_m, mapping_m, log)
+    check(summary_m['ok'] == 1, 'xls 合并标题模板填充成功（无 overwrite cell 错）')
+    rb_m = xlrd.open_workbook(str(plan_m[0].dst), formatting_info=True)
+    s_m = rb_m.sheet_by_index(0)
+    check(s_m.cell_value(0, 0) == '对账单', '合并标题保留')
+    check((0, 1, 0, 4) in [tuple(m) for m in s_m.merged_cells], '合并单元格保留')
+    check(s_m.cell_value(2, 1) == '张三', 'B3 填入张三')
+    rb_m.release_resources()
+
+    # --- 6) 内置数字格式：xlrd 对部分内置格式返回 format_str=None，转换不得产生 None ---
+    rb6 = xlrd.open_workbook(str(src_xls), formatting_info=True)
+    for fk, fmt in rb6.format_map.items():
+        check(excel_core._resolve_num_format(rb6, fk) is not None,
+              f'format_key {fk} 解析非 None')
+    for fk in (27, 28, 29, 30, 50, 51):  # xlrd 返回 None format_str 的内置 key
+        check(excel_core._resolve_num_format(rb6, fk) is not None,
+              f'内置格式 {fk} 回退非 None')
+    # 模拟 format_str=None 时，_make_xlwt_style 也不得产生 None num_format_str
+    class _Fmt:
+        format_str = None
+    class _Xf:
+        font_index = 0
+        format_key = 27
+        border = type('B', (), {'left_line_style': 1, 'right_line_style': 1,
+                                'top_line_style': 1, 'bottom_line_style': 1})()
+        background = type('Bg', (), {'fill_pattern': 0, 'pattern_colour_index': 0,
+                                     'background_colour_index': 0})()
+        alignment = type('Al', (), {'hor_align': 0, 'vert_align': 0, 'text_wrapped': 0})()
+    class _Font:
+        name = 'Arial'
+        bold = 0
+        italic = 0
+        height = 200
+        colour_index = 32767
+    class _Book:
+        xf_list = [_Xf()]
+        font_list = [_Font()]
+        format_map = {27: _Fmt()}
+    st = excel_core._make_xlwt_style(_Book(), 0)
+    check(st.num_format_str is not None, '防护后 num_format_str 非 None')
+    check(st.num_format_str == 'General', 'None 格式串回退为 General')
+    rb6.release_resources()
+
+    # --- 7) 带货币内置格式的 .xls 模板填充不报错 ---
+    tpl_cur = OUT / '货币模板.xls'
+    wb = xlwt.Workbook()
+    ws = wb.add_sheet('对账单模板')
+    ws.write(2, 1, None, xlwt.easyxf('', num_format_str='#,##0.00'))
+    wb.save(str(tpl_cur))
+    plan_cur, _ = excel_core.plan_fill([str(src_xls)], str(tpl_cur), [('cell', 'C3', 'B3')], OUT)
+    sum_cur = excel_core.execute_fill(str(tpl_cur), plan_cur, [('cell', 'C3', 'B3')], log)
+    check(sum_cur['ok'] == 1, '货币格式模板填充成功')
+
+
+def test_fill_merged_cell():
+    """映射到合并单元格：目标在合并区非左上角时自动重定向到锚点，值可见不丢失。"""
+    from openpyxl import Workbook as WX, load_workbook as LW
+    clean_out()
+
+    # 源
+    src = OUT / 'src.xlsx'
+    wb = WX()
+    wb.active['A1'] = '张三'
+    wb.save(src)
+
+    # --- .xlsx：B2:C2 合并，映射源 A1 → C2（非锚点） ---
+    tpl = OUT / 'm.xlsx'
+    wb = WX()
+    ws = wb.active
+    ws.merge_cells('B2:C2')
+    ws['B2'] = '原值'
+    wb.save(tpl)
+    mapping = [('cell', 'A1', 'C2')]
+    plan, _ = excel_core.plan_fill([str(src)], str(tpl), mapping, OUT)
+    summary = excel_core.execute_fill(str(tpl), plan, mapping, log)
+    check(summary['ok'] == 1, 'xlsx 映射到合并区非锚点不再报错')
+    ws2 = LW(plan[0].dst).worksheets[0]
+    check(ws2['B2'].value == '张三', 'xlsx 值写入合并区锚点 B2')
+
+    # --- .xls：B2:C2 合并，映射源 A1 → C2（非锚点） ---
+    import xlwt
+    tpl_x = OUT / 'm.xls'
+    wb = xlwt.Workbook()
+    ws = wb.add_sheet('S')
+    ws.write_merge(1, 1, 1, 2, '原值')   # B2:C2
+    wb.save(str(tpl_x))
+    plan, _ = excel_core.plan_fill([str(src)], str(tpl_x), mapping, OUT)
+    summary = excel_core.execute_fill(str(tpl_x), plan, mapping, log)
+    check(summary['ok'] == 1, 'xls 映射到合并区非锚点成功')
+    import xlrd
+    s = xlrd.open_workbook(str(plan[0].dst), formatting_info=True).sheet_by_index(0)
+    check(s.cell_value(1, 1) == '张三', 'xls 值写入合并区锚点 B2(0基1,1)')
+    # 合并区非锚点 C2 不应有独立值（可能未计入使用范围）
+    if s.ncols > 2:
+        check(s.cell_value(1, 2) == '', 'xls 合并区非锚点 C2 无独立值')
+    check((1, 2, 1, 3) in [tuple(m) for m in s.merged_cells], 'xls 合并单元格保留')
+
+
+if __name__ == '__main__':
+    test_rename()
+    test_rename_advanced()
+    test_fill()
+    test_fill_column()
+    test_fill_column_row_boundary()
+    test_fill_column_merged()
+    test_xls()
+    test_fill_merged_cell()
+    print('\n全部测试通过 ✅')
