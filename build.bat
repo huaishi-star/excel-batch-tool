@@ -4,7 +4,7 @@ setlocal
 cd /d "%~dp0"
 
 echo ============================================
-echo   Excel 批量处理工具 - 一键打包
+echo   Lsy的Excel-Tool - 一键打包
 echo ============================================
 
 echo.
@@ -30,7 +30,7 @@ if errorlevel 1 (
 
 echo.
 echo [2/3] 开始打包（约需 1-3 分钟）...
-python -m PyInstaller --noconfirm --clean --onefile --windowed --name ExcelBatchTool ^
+python -m PyInstaller --noconfirm --clean --onefile --windowed --name "Lsy的Excel-Tool" ^
     --exclude-module unittest --exclude-module pydoc_data --exclude-module test ^
     --exclude-module numpy --exclude-module PIL --exclude-module lxml ^
     --exclude-module scipy --exclude-module pandas --exclude-module matplotlib --exclude-module sklearn app.py
@@ -44,7 +44,7 @@ if errorlevel 1 (
 echo.
 echo [3/3] 打包完成！
 echo.
-echo 输出文件: %~dp0dist\ExcelBatchTool.exe
+echo 输出文件: %~dp0dist\Lsy的Excel-Tool.exe
 echo 把这个 exe 拷贝到其他 Windows 电脑上双击即可运行（无需安装 Python/Excel）
 echo.
 pause

@@ -1,8 +1,9 @@
-"""Excel 批量处理工具 — 图形界面入口。
+"""Lsy的Excel-Tool — 图形界面入口。
 
-界面分两个标签页：
+界面分三个标签页：
 1. 批量重命名：按单元格组合规则复制重命名
 2. 模板填充：按映射关系把源文件数据填入模板
+3. 行/列删除：按条件批量删除行/列
 
 线程安全约定：工作线程只往 queue 里放消息，主线程用 after() 轮询并更新界面，
 工作线程绝不直接触碰任何 tkinter 控件。
@@ -34,7 +35,7 @@ EXCEL_TYPES = [('Excel 文件', '*.xlsx *.xlsm *.xls')]
 def _write_exception_log():
     try:
         base = Path(sys.executable if getattr(sys, 'frozen', False) else __file__)
-        log_path = base.with_name('ExcelBatchTool_错误日志.txt')
+        log_path = base.with_name('Lsy的Excel-Tool_错误日志.txt')
         with open(log_path, 'a', encoding='utf-8') as f:
             f.write(''.join(traceback.format_exception(*sys.exc_info())) + '\n')
     except Exception:
@@ -662,8 +663,8 @@ class FillTab(BaseTab):
         row1 = ttk.Frame(edit)
         row1.pack(fill='x', pady=(6, 6))
         ttk.Label(row1, text='添加方式：').pack(side='left')
-        self.map_type = ttk.Combobox(row1, state='readonly', width=13,
-                                     values=['单元格 → 单元格', '整列 → 整列'])
+        self.map_type = ttk.Combobox(row1, state='readonly', width=15,
+                                     values=['单元格 → 单元格', '整列 → 整列', '列求和 → 单元格'])
         self.map_type.set('单元格 → 单元格')
         self.map_type.bind('<<ComboboxSelected>>', lambda e: self._toggle_map_type())
         self.map_type.pack(side='left', padx=(6, 0))
@@ -696,6 +697,18 @@ class FillTab(BaseTab):
         self.tpl_row_entry = ttk.Entry(self.col_frame, width=4)
         self.tpl_row_entry.pack(side='left', padx=(2, 0))
         ttk.Label(self.col_frame, text='行').pack(side='left', padx=(2, 0))
+
+        # 列求和模式
+        self.sum_frame = ttk.Frame(self.input_frame)
+        ttk.Label(self.sum_frame, text='源列：').pack(side='left')
+        self.sum_col_entry = ttk.Entry(self.sum_frame, width=5)
+        self.sum_col_entry.pack(side='left', padx=(2, 0))
+        ttk.Label(self.sum_frame, text='从第').pack(side='left', padx=(4, 0))
+        self.sum_row_entry = ttk.Entry(self.sum_frame, width=4)
+        self.sum_row_entry.pack(side='left', padx=(2, 0))
+        ttk.Label(self.sum_frame, text='行  → 模板单元格：').pack(side='left', padx=(6, 0))
+        self.sum_tpl_entry = ttk.Entry(self.sum_frame, width=8)
+        self.sum_tpl_entry.pack(side='left', padx=(2, 0))
 
         # 第二行：操作按钮（独占一行，间距宽松）
         row2 = ttk.Frame(edit)
@@ -766,20 +779,26 @@ class FillTab(BaseTab):
             self.template_var.set(p)
 
     def _toggle_map_type(self):
-        if self.map_type.get().startswith('单元格'):
-            self.col_frame.pack_forget()
+        kind = self.map_type.get()
+        # 先收起全部输入框
+        for f in (self.cell_frame, self.col_frame, self.sum_frame):
+            f.pack_forget()
+        if kind.startswith('单元格'):
             self.cell_frame.pack(side='left')
-        else:
-            self.cell_frame.pack_forget()
+        elif kind.startswith('整列'):
             self.col_frame.pack(side='left')
+        else:
+            self.sum_frame.pack(side='left')
 
     def _clear_map_inputs(self):
         for e in (self.src_entry, self.tpl_entry, self.src_col_entry, self.src_row_entry,
-                  self.tpl_col_entry, self.tpl_row_entry):
+                  self.tpl_col_entry, self.tpl_row_entry, self.sum_col_entry,
+                  self.sum_row_entry, self.sum_tpl_entry):
             e.delete(0, 'end')
 
     def _add_map(self):
-        if self.map_type.get().startswith('单元格'):
+        kind = self.map_type.get()
+        if kind.startswith('单元格'):
             src = self.src_entry.get().strip().upper()
             tpl = self.tpl_entry.get().strip().upper()
             if not (src and tpl):
@@ -790,7 +809,7 @@ class FillTab(BaseTab):
                     messagebox.showerror('格式错误', f'{name}应为 A1、B3 这样的坐标：{c!r}', parent=self)
                     return
             m = ['cell', src, tpl]
-        else:  # 整列
+        elif kind.startswith('整列'):
             src_col = self.src_col_entry.get().strip().upper()
             tpl_col = self.tpl_col_entry.get().strip().upper()
             src_row = self.src_row_entry.get().strip()
@@ -811,6 +830,28 @@ class FillTab(BaseTab):
                 messagebox.showerror('格式错误', '起始行应为正整数', parent=self)
                 return
             m = ['column', src_col, src_row, tpl_col, tpl_row]
+        else:  # 列求和
+            src_col = self.sum_col_entry.get().strip().upper()
+            src_row = self.sum_row_entry.get().strip()
+            tpl = self.sum_tpl_entry.get().strip().upper()
+            if not (src_col and src_row and tpl):
+                messagebox.showinfo('提示', '请填写源列、起始行与模板单元格', parent=self)
+                return
+            if not excel_core.COL_RE.match(src_col):
+                messagebox.showerror('格式错误', '列应为 A、B、AA 这样的字母', parent=self)
+                return
+            try:
+                src_row = int(src_row)
+            except ValueError:
+                messagebox.showerror('格式错误', '起始行应为正整数', parent=self)
+                return
+            if src_row < 1:
+                messagebox.showerror('格式错误', '起始行应为正整数', parent=self)
+                return
+            if not excel_core.CELL_RE.match(tpl):
+                messagebox.showerror('格式错误', f'模板单元格应为 A1、B3 这样的坐标：{tpl!r}', parent=self)
+                return
+            m = ['sum', src_col, src_row, tpl]
         if m in self._mappings:
             messagebox.showinfo('提示', '该映射已存在', parent=self)
             return
@@ -823,8 +864,10 @@ class FillTab(BaseTab):
         for m in self._mappings:
             if m[0] == 'cell':
                 self.tree.insert('', 'end', values=('单元格', m[1], m[2]))
-            else:
+            elif m[0] == 'column':
                 self.tree.insert('', 'end', values=('整列', f'{m[1]}列 从第{m[2]}行', f'{m[3]}列 从第{m[4]}行'))
+            else:
+                self.tree.insert('', 'end', values=('求和', f'{m[1]}列 从第{m[2]}行', m[3]))
 
     def _del_map(self):
         for iid in reversed(self.tree.selection()):
@@ -888,6 +931,14 @@ class FillTab(BaseTab):
                     continue
                 if sr >= 1 and tr >= 1:
                     self._mappings.append(['column', str(m[1]).upper(), sr, str(m[3]).upper(), tr])
+            elif m and m[0] == 'sum' and len(m) == 4 \
+                    and excel_core.COL_RE.match(str(m[1])) and excel_core.CELL_RE.match(str(m[3])):
+                try:
+                    sr = int(m[2])
+                except (ValueError, TypeError):
+                    continue
+                if sr >= 1:
+                    self._mappings.append(['sum', str(m[1]).upper(), sr, str(m[3]).upper()])
         self._refresh_map_tree()
         self._append_log(f'[提示] 已载入映射「{name}」')
 
@@ -1288,7 +1339,7 @@ class DeleteTab(BaseTab):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title('Excel 批量处理工具')
+        self.title('Lsy的Excel-Tool')
         self.geometry('900x740')
         self.minsize(800, 620)
 

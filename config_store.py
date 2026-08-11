@@ -5,7 +5,7 @@
 - fill:   {名称: {"mapping": [["A1", "B2"], ...]}}
 
 配置文件默认保存在软件所在目录（便携，随 exe 拷贝带走）；
-若该目录不可写（如 Program Files），自动回退到 %APPDATA%\\ExcelBatchTool\\。
+若该目录不可写（如 Program Files），自动回退到 %APPDATA%\\Lsy的Excel-Tool\\。
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import os
 import sys
 from pathlib import Path
 
-CONFIG_NAME = 'ExcelBatchTool_profiles.json'
+CONFIG_NAME = 'Lsy的Excel-Tool_profiles.json'
 KINDS = ('rename', 'fill', 'delete')
 
 # 测试可覆盖的基准目录；为 None 时使用默认位置
@@ -35,7 +35,7 @@ def _default_dir() -> Path:
 
 
 def _appdata_dir() -> Path:
-    return Path(os.environ.get('APPDATA', str(Path.home()))) / 'ExcelBatchTool'
+    return Path(os.environ.get('APPDATA', str(Path.home()))) / 'Lsy的Excel-Tool'
 
 
 def config_paths() -> list[Path]:

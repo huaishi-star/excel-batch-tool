@@ -502,6 +502,73 @@ def test_fill_merged_cell():
     check((1, 2, 1, 3) in [tuple(m) for m in s.merged_cells], 'xls 合并单元格保留')
 
 
+def test_fill_sum():
+    """列求和：数值/数值型字符串/前后空格/千分位 → 准确转换求和，填入指定或合并单元格。"""
+    from openpyxl import Workbook as WX, load_workbook as LW
+    clean_out()
+
+    # 数值转换边界
+    check(excel_core._to_number(' 100 ') == 100.0, '字符型数字去空格 100')
+    check(excel_core._to_number('1,500.5') == 1500.5, '千分位 1,500.5')
+    check(excel_core._to_number(5) == 5.0, '数字 5')
+    check(excel_core._to_number('abc') is None, '非数字文本 → None')
+    check(excel_core._to_number('') is None, '空串 → None')
+    check(excel_core._to_number(True) is None, '布尔 → None')
+
+    # 源 .xlsx：B 列 2..6 行 = 100, ' 200 ', 300, '1,500.5', '作废'（非数值跳过），第7行空
+    src = OUT / 'sum.xlsx'
+    wb = WX()
+    ws = wb.active
+    ws['B2'] = 100
+    ws['B3'] = ' 200 '
+    ws['B4'] = 300
+    ws['B5'] = '1,500.5'
+    ws['B6'] = '作废'
+    wb.save(src)
+
+    total, count = excel_core.sum_column(str(src), 'B', 2)
+    check(abs(total - 2100.5) < 1e-9, f'求和 = 2100.5（实际 {total}）')
+    check(count == 4, f'有效数值 4 个（实际 {count}）')
+
+    # 求和填入模板普通单元格
+    tpl = OUT / 't.xlsx'
+    wb = WX()
+    ws = wb.active
+    ws['D5'] = None
+    ws['D5'].number_format = '#,##0.00'
+    wb.save(tpl)
+    mapping = [('sum', 'B', 2, 'D5')]
+    plan, _ = excel_core.plan_fill([str(src)], str(tpl), mapping, OUT)
+    summary = excel_core.execute_fill(str(tpl), plan, mapping, log)
+    check(summary['ok'] == 1, '求和填充成功')
+    ws2 = LW(plan[0].dst).worksheets[0]
+    check(abs(ws2['D5'].value - 2100.5) < 1e-9, f'D5 = 2100.5（实际 {ws2["D5"].value}）')
+    check(ws2['D5'].number_format == '#,##0.00', '模板数字格式保留')
+
+    # 求和填入合并单元格（非锚点自动定位到锚点）
+    tpl2 = OUT / 't2.xlsx'
+    wb = WX()
+    ws = wb.active
+    ws.merge_cells('D5:E5')
+    ws['D5'] = None
+    wb.save(tpl2)
+    plan, _ = excel_core.plan_fill([str(src)], str(tpl2), [('sum', 'B', 2, 'E5')], OUT)
+    excel_core.execute_fill(str(tpl2), plan, [('sum', 'B', 2, 'E5')], log)
+    ws2 = LW(plan[0].dst).worksheets[0]
+    check(abs(ws2['D5'].value - 2100.5) < 1e-9, f'合并单元格锚点 D5 = 2100.5（实际 {ws2["D5"].value}）')
+
+    # .xls 源
+    import xlwt
+    src_x = OUT / 'sum.xls'
+    wb = xlwt.Workbook()
+    ws = wb.add_sheet('S')
+    for r, v in zip((1, 2, 3), (' 100 ', 200, '300.5')):
+        ws.write(r, 1, v)
+    wb.save(str(src_x))
+    total, count = excel_core.sum_column(str(src_x), 'B', 2)
+    check(abs(total - 600.5) < 1e-9, f'xls 求和 = 600.5（实际 {total}）')
+
+
 def test_delete():
     """行/列删除：等于/包含匹配，.xlsx 与 .xls 两种格式。"""
     from openpyxl import Workbook as WX, load_workbook as LW
@@ -596,5 +663,6 @@ if __name__ == '__main__':
     test_fill_column_merged()
     test_xls()
     test_fill_merged_cell()
+    test_fill_sum()
     test_delete()
     print('\n全部测试通过 ✅')

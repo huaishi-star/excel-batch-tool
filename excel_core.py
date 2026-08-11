@@ -518,6 +518,58 @@ def _open_source(path):
     return _OpenpyxlSource(path)
 
 
+# ---------------------------------------------------------------------------
+# 列求和：把源文件某列（含数值型字符串、前后空格）准确转成数字并求和
+# ---------------------------------------------------------------------------
+
+def _to_number(value):
+    """把单元格值转换为数字：数值直接返回；字符串去掉首尾空格（含千分位逗号）后转换。
+
+    无法转换（空、布尔、非数字文本）返回 None。
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        try:
+            return float(s)
+        except ValueError:
+            try:
+                return float(s.replace(',', ''))
+            except ValueError:
+                return None
+    return None
+
+
+def _sum_values(values) -> tuple:
+    """对值列表中的数值（含数值型字符串）求和。返回 (总和, 有效数值个数)。"""
+    total = 0.0
+    count = 0
+    for v in values:
+        n = _to_number(v)
+        if n is not None:
+            total += n
+            count += 1
+    return total, count
+
+
+def sum_column(path, col: str, start_row: int) -> tuple:
+    """读取源文件某列自 start_row 起（到第一个空单元格止）的所有数值并求和。
+
+    返回 (总和, 有效数值个数)，供预览与执行共用。
+    """
+    src = _open_source(path)
+    try:
+        values = src.column(col, start_row)
+    finally:
+        src.close()
+    return _sum_values(values)
+
+
 # Excel 内置数字格式串（xlrd 对部分内置格式返回 format_str=None，需自行补齐）
 _BUILTIN_FORMATS = {
     1: '0', 2: '0.00', 3: '#,##0', 4: '#,##0.00',
@@ -689,10 +741,12 @@ def execute_fill(template_path, plan: list[FillItem], mapping: list[tuple],
                  cancel_event: Optional[Event] = None) -> dict:
     """执行模板填充计划。
 
-    映射条目支持两种（均指第一个工作表）：
+    映射条目支持三种（均指第一个工作表）：
       ('cell', 'A1', 'B2')      → 源单元格内容写入模板单元格（None 写空串以清空）
       ('column', 'C', 2, 'B', 6)→ 源文件 C 列自第 2 行向下（到空单元格为止）的数据，
                                  写入模板 B 列自第 6 行开始；目标已有内容时插入空白行下移，不覆盖
+      ('sum', 'B', 2, 'D5')     → 源文件 B 列自第 2 行向下（到空单元格为止）的所有数值
+                                 求和，结果写入模板 D5（支持合并单元格，自动定位锚点）
 
     每个源文件：重新加载模板副本（避免输出互相污染），写入后保存到目标路径。
     - .xlsx/.xlsm 模板：openpyxl 往返保留格式；整列映射用插入空白行扩展。
@@ -721,8 +775,12 @@ def execute_fill(template_path, plan: list[FillItem], mapping: list[tuple],
             for m in mapping:
                 if m[0] == 'cell':
                     cell_values[m[2]] = src.cell(m[1])
-                else:  # column
+                elif m[0] == 'column':
                     column_jobs.append((m[3], m[4], src.column(m[1], m[2])))
+                elif m[0] == 'sum':
+                    _, src_col, src_start, tpl_coord = m
+                    total, _ = _sum_values(src.column(src_col, src_start))
+                    cell_values[tpl_coord] = total
             src.close()
             src = None
 

@@ -13,8 +13,9 @@ exp*.xls
 m_test.xlsx
 
 # 运行时数据（用户保存的规则，不入库）
-ExcelBatchTool_profiles.json
-ExcelBatchTool_错误日志.txt
+Lsy的Excel-Tool_profiles.json
+Lsy的Excel-Tool_错误日志.txt
 
 # 便携版压缩包（构建产物）
 ExcelBatchTool_便携版.zip
+Lsy的Excel-Tool_便携版.zip
