@@ -94,7 +94,10 @@
 - **载入**：把选中的记录恢复到规则区/映射表，直接使用或继续修改
 - **删除**：删除选中的记录
 
-可保存**多套规则**，随时调用。配置文件 `Lsy的Excel-Tool_profiles.json` 与软件放在同一目录，**拷贝 exe 时一起拷贝即可带走规则**。
+可保存**多套规则**，随时调用。配置文件位置：
+
+- **Windows**：`Lsy的Excel-Tool_profiles.json` 与软件放在同一目录，**拷贝 exe 时一起拷贝即可带走规则**；若目录不可写，自动回退到 `%APPDATA%\Lsy的Excel-Tool\`
+- **macOS**：`~/Library/Application Support/Lsy的Excel-Tool/Lsy的Excel-Tool_profiles.json`（`.app` 内部通常不可写，规则放用户目录）
 
 ## 格式支持
 
@@ -116,7 +119,11 @@
 
 ## 开发与打包
 
-环境要求：Windows + Python 3.10+。
+环境要求：
+- **Windows**：Python 3.10+
+- **macOS**：Python 3.12+（建议用 [python.org](https://www.python.org/downloads/macos/) 的安装包，自带 Tkinter；Homebrew Python 需额外安装 `python-tk`）
+
+### Windows
 
 ```bash
 # 运行依赖
@@ -134,3 +141,68 @@ build.bat
 
 把 `dist\Lsy的Excel-Tool.exe` 拷贝到其他 Windows 10/11 电脑上双击即可运行。
 首次运行可能弹出 SmartScreen"已保护你的电脑"提示（软件未签名），点 **更多信息 → 仍要运行** 即可。
+
+### macOS（Apple Silicon）
+
+**方式一：直接运行源码**
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python app.py
+```
+
+**方式二：本地打包 `.app`**
+
+```bash
+chmod +x build_macos.sh
+./build_macos.sh
+```
+
+产物：
+- `dist/Lsy的Excel-Tool.app`
+- `dist/Lsy的Excel-Tool-macos-arm64.zip`
+
+**方式三：GitHub Actions 自动打包（推荐用于分发）**
+
+仓库已包含 `.github/workflows/build-macos.yml`：
+
+1. 打开 GitHub 仓库 → **Actions** → **Build macOS App** → **Run workflow**
+2. 构建完成后，在该次运行的 **Artifacts** 中下载 `Lsy的Excel-Tool-macos-arm64.zip`
+3. 打 `v*` 标签时也会自动触发构建
+
+> 说明：构建机器是 GitHub 的 Apple Silicon（arm64）runner；Windows 无法交叉编译 macOS 程序，所以必须在 macOS 或 CI 上构建。
+
+**首次打开被 Gatekeeper 拦截时：**
+
+- 右键点击 `.app` → **打开** → 再点 **打开**；或
+- 在终端执行：`xattr -dr com.apple.quarantine "/Applications/Lsy的Excel-Tool.app"`
+- 或在 **系统设置 → 隐私与安全性** 中点击 **仍要打开**
+
+**给同事/朋友分发（推荐签名+公证）：**
+
+未签名的 `.app` 在较新 macOS 上会提示"无法验证开发者"。正式分发需要：
+
+1. 加入 Apple Developer Program（99 美元/年）
+2. 在钥匙串安装 **Developer ID Application** 证书
+3. 设置环境变量后执行：
+
+```bash
+export CERT_ID="Developer ID Application: 你的名字 (TEAMID)"
+export APPLE_ID="you@example.com"
+export APPLE_TEAM_ID="TEAMID"
+export APPLE_APP_PASSWORD="xxxx-xxxx-xxxx-xxxx"
+./scripts/sign_and_notarize.sh "dist/Lsy的Excel-Tool.app"
+```
+
+脚本会完成 `codesign` → `notarytool` 公证 → `stapler staple`，并重新生成可分发的 zip。
+
+**macOS 数据位置：**
+
+- 规则配置：`~/Library/Application Support/Lsy的Excel-Tool/Lsy的Excel-Tool_profiles.json`
+- 错误日志：`~/Library/Logs/Lsy的Excel-Tool/Lsy的Excel-Tool_错误日志.txt`
+- 从 Windows 迁移已保存规则：把 Windows 版旁边的 `Lsy的Excel-Tool_profiles.json` 复制到上面的 macOS 配置目录即可
+- 首次选择桌面、文稿、下载等目录时，macOS 会弹出权限请求，请点 **允许**
+
+**Intel Mac：** 当前 CI 只构建 arm64。如果还需要支持 Intel，可将 `runs-on` 改为 `macos-13` 再构建一份 x86_64 包，或用 universal2 Python 构建 universal2 包。

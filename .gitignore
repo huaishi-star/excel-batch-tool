@@ -2,6 +2,12 @@
 __pycache__/
 *.pyc
 
+# 虚拟环境（macOS/Linux 构建脚本会创建）
+.venv/
+
+# macOS
+.DS_Store
+
 # PyInstaller 构建产物
 build/
 dist/

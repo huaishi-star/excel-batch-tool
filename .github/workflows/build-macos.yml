@@ -1,0 +1,75 @@
+name: Build macOS App
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  build-macos-arm64:
+    # GitHub 标准 macOS 14 runner 为 Apple Silicon（arm64）
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Show environment
+        run: |
+          uname -m
+          python --version
+          python -c "import tkinter; print('Tk', tkinter.TkVersion)"
+
+      - name: Ensure Apple Silicon runner
+        run: |
+          test "$(uname -m)" = "arm64" || {
+            echo "::error::当前 runner 不是 arm64，请使用 Apple Silicon runner（如 macos-14）"
+            exit 1
+          }
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller==6.22.0
+
+      - name: Run core tests
+        run: |
+          python test_make_samples.py
+          python test_core.py
+
+      - name: Build .app
+        run: |
+          python -m PyInstaller --noconfirm --clean --windowed \
+            --name "Lsy的Excel-Tool" \
+            --osx-bundle-identifier "com.lsy.excel-tool" \
+            --exclude-module unittest --exclude-module pydoc_data --exclude-module test \
+            --exclude-module numpy --exclude-module PIL --exclude-module lxml \
+            --exclude-module scipy --exclude-module pandas --exclude-module matplotlib \
+            --exclude-module sklearn app.py
+
+      - name: Verify bundle
+        run: |
+          test -d "dist/Lsy的Excel-Tool.app"
+          file "dist/Lsy的Excel-Tool.app/Contents/MacOS/Lsy的Excel-Tool"
+
+      - name: Zip app
+        run: |
+          ARCH="$(uname -m)"
+          ditto -c -k --keepParent "dist/Lsy的Excel-Tool.app" \
+            "dist/Lsy的Excel-Tool-macos-${ARCH}.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Lsy的Excel-Tool-macos-arm64
+          path: dist/Lsy的Excel-Tool-macos-*.zip
+          if-no-files-found: error

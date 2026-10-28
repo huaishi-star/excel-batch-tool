@@ -55,9 +55,13 @@ def test_rename():
         stem = p.src.stem
         if stem in expect:
             check(p.name == expect[stem], f'{stem} 新文件名 {p.name} == {expect[stem]}')
-    # 数据5 超长截断到 150
+    # 数据5 超长截断到 150 字符；macOS 还要满足 APFS 的 255 字节文件名上限
     d5 = next(p for p in plan if p.src.stem == '数据5')
-    check(d5.name == '很' * 150 + '.xlsx', f'超长截断到 150 字符（实际 {len(Path(d5.name).stem)}）')
+    expect_d5_stem = '很' * 150
+    if sys.platform == 'darwin':
+        expect_d5_stem = expect_d5_stem.encode('utf-8')[:240].decode('utf-8', errors='ignore')
+    check(d5.name == expect_d5_stem + '.xlsx',
+          f'超长截断（实际 {len(Path(d5.name).stem)} 字符）')
 
     # 纯保留设备名（单单元格）应加下划线前缀
     check(excel_core.sanitize_name_part('CON') == '_CON', '保留名 CON 前缀下划线')
@@ -761,6 +765,38 @@ def test_split():
     out.close()
 
 
+def test_macos_filename_limits():
+    """macOS 文件名按 UTF-8 字节截断（APFS 上限 255 字节）。"""
+    old = sys.platform
+    try:
+        sys.platform = 'darwin'
+        out = excel_core.truncate_stem('很' * 160)
+        check(len(out.encode('utf-8')) <= 240,
+              f'macOS 文件名 ≤240 字节（实际 {len(out.encode("utf-8"))}）')
+        check(out == '很' * 80, f'macOS 中文长名截断到 {len(out)} 字')
+        check(excel_core.truncate_stem('a' * 160) == 'a' * 150,
+              'macOS ASCII 仍按 150 字符截断')
+    finally:
+        sys.platform = old
+
+
+def test_config_paths():
+    """配置目录：macOS 使用用户数据目录，Windows 保持软件目录优先。"""
+    import config_store
+    old = sys.platform
+    try:
+        sys.platform = 'darwin'
+        mac = [str(p) for p in config_store.config_paths()]
+        check(any('Application Support' in p and 'Lsy的Excel-Tool' in p for p in mac),
+              f'macOS 配置目录 {mac}')
+        sys.platform = 'win32'
+        win = [str(p) for p in config_store.config_paths()]
+        check(win and 'Lsy的Excel-Tool_profiles.json' in win[0],
+              f'Windows 配置目录 {win}')
+    finally:
+        sys.platform = old
+
+
 if __name__ == '__main__':
     test_rename()
     test_rename_advanced()
@@ -773,4 +809,6 @@ if __name__ == '__main__':
     test_fill_sum()
     test_delete()
     test_split()
+    test_macos_filename_limits()
+    test_config_paths()
     print('\n全部测试通过 ✅')

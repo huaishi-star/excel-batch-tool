@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import re
 import shutil
+import sys
 import xml.etree.ElementTree as ET
 import zipfile
 from copy import copy
@@ -135,6 +136,8 @@ def _xlrd_cell_value(book, sheet, r: int, c: int):
 MAX_STEM = 150
 # 完整路径最长字符数（避开 Windows MAX_PATH=260，留余量）
 MAX_PATH = 250
+# macOS 完整路径上限（PATH_MAX=1024 字节，留余量给重名后缀）
+MAX_PATH_BYTES_MAC = 980
 
 LogFn = Callable[[str], None]
 ProgressFn = Callable[[int, int], None]
@@ -249,10 +252,18 @@ def sanitize_name_part(part: str) -> str:
 
 
 def truncate_stem(stem: str, max_stem: int = MAX_STEM) -> str:
-    """把主文件名截断到 max_stem 字符，并保证结尾不是点或空格。"""
-    if len(stem) <= max_stem:
-        return stem
-    return stem[:max_stem].rstrip(' .')
+    """把主文件名截断到 max_stem 字符，并保证结尾不是点或空格。
+
+    macOS 的 APFS 文件名上限是 255 个 UTF-8 字节，中文名按字符截断后仍可能超限，
+    因此在 macOS 上再按字节截断一次（240 字节，留出扩展名余量）。
+    """
+    if len(stem) > max_stem:
+        stem = stem[:max_stem]
+    if sys.platform == 'darwin':
+        raw = stem.encode('utf-8')
+        if len(raw) > 240:
+            stem = raw[:240].decode('utf-8', errors='ignore')
+    return stem.rstrip(' .')
 
 
 def unique_path(dst: Path, used: set[str]) -> Path:
@@ -282,6 +293,11 @@ def build_dest_name(stem: str, ext: str, out_dir, used: set[str],
     while len(str(dst)) > max_path and len(stem) > 5:
         stem = stem[:-5].rstrip(' .')
         dst = Path(out_dir) / f'{stem}{ext}'
+    # macOS 的 PATH_MAX 按字节计算，中文路径可能字符数没超但字节数超了
+    if sys.platform == 'darwin':
+        while len(str(dst).encode('utf-8')) > MAX_PATH_BYTES_MAC and len(stem) > 5:
+            stem = stem[:-5].rstrip(' .')
+            dst = Path(out_dir) / f'{stem}{ext}'
     return unique_path(dst, used)
 
 

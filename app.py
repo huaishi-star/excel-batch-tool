@@ -28,15 +28,29 @@ import config_store
 
 EXCEL_TYPES = [('Excel 文件', '*.xlsx *.xlsm *.xls')]
 
+IS_MAC = sys.platform == 'darwin'
+IS_WIN = sys.platform == 'win32'
+# macOS 没有微软雅黑，使用系统中文字体；Windows 保持原字体
+UI_FONT = 'PingFang SC' if IS_MAC else 'Microsoft YaHei UI'
+
 
 # ---------------------------------------------------------------------------
 # 全局异常兜底（--windowed 打包后无控制台，把未捕获异常写入 exe 旁日志）
 # ---------------------------------------------------------------------------
 
+def _log_dir() -> Path:
+    """错误日志目录：macOS 写用户日志目录，Windows 仍写在 exe/脚本旁。"""
+    if IS_MAC:
+        return Path.home() / 'Library' / 'Logs' / 'Lsy的Excel-Tool'
+    base = Path(sys.executable if getattr(sys, 'frozen', False) else __file__)
+    return base.parent
+
+
 def _write_exception_log():
     try:
-        base = Path(sys.executable if getattr(sys, 'frozen', False) else __file__)
-        log_path = base.with_name('Lsy的Excel-Tool_错误日志.txt')
+        log_dir = _log_dir()
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / 'Lsy的Excel-Tool_错误日志.txt'
         with open(log_path, 'a', encoding='utf-8') as f:
             f.write(''.join(traceback.format_exception(*sys.exc_info())) + '\n')
     except Exception:
@@ -162,7 +176,17 @@ class ScrollableFrame(ttk.Frame):
         # 自身带滚动条的控件（文本框/列表）交给它们自己处理，避免双重滚动
         if w.winfo_class() in ('Text', 'Listbox', 'TCombobox', 'Treeview'):
             return
-        self._canvas.yview_scroll(int(-event.delta / 120), 'units')
+        if IS_MAC:
+            # macOS 滚轮/触控板 delta 通常只有 ±1（Windows 是 ±120）
+            delta = -event.delta
+            if abs(delta) >= 1:
+                step = int(delta)
+            else:
+                step = 1 if delta > 0 else (-1 if delta < 0 else 0)
+        else:
+            step = int(-event.delta / 120)
+        if step:
+            self._canvas.yview_scroll(step, 'units')
 
 
 # ---------------------------------------------------------------------------
@@ -267,7 +291,7 @@ class BaseTab(ttk.Frame):
         frame = ttk.LabelFrame(parent, text='运行日志')
         frame.pack(fill='x', padx=8, pady=(4, 8))
         self.log_text = ScrolledText(frame, height=7, state='disabled', wrap='word',
-                                     font=('Microsoft YaHei UI', 9))
+                                     font=(UI_FONT, 9))
         self.log_text.pack(fill='both', expand=True, padx=4, pady=4)
         self.log_text.tag_configure('ok', foreground='#1a7f37')
         self.log_text.tag_configure('skip', foreground='#9a6700')
@@ -386,7 +410,7 @@ class RenameTab(BaseTab):
         pbox = ttk.Frame(prev)
         pbox.pack(fill='both', expand=True, padx=6, pady=(2, 6))
         self.preview_text = tk.Text(pbox, height=4, state='disabled', wrap='none',
-                                    font=('Microsoft YaHei UI', 9))
+                                    font=(UI_FONT, 9))
         hsb = ttk.Scrollbar(pbox, orient='horizontal', command=self.preview_text.xview)
         self.preview_text.configure(xscrollcommand=hsb.set)
         hsb.pack(side='bottom', fill='x')
@@ -748,7 +772,7 @@ class FillTab(BaseTab):
         pbox = ttk.Frame(prev)
         pbox.pack(fill='both', expand=True, padx=6, pady=(2, 6))
         self.preview_text = tk.Text(pbox, height=3, state='disabled', wrap='none',
-                                    font=('Microsoft YaHei UI', 9))
+                                    font=(UI_FONT, 9))
         hsb = ttk.Scrollbar(pbox, orient='horizontal', command=self.preview_text.xview)
         self.preview_text.configure(xscrollcommand=hsb.set)
         hsb.pack(side='bottom', fill='x')
@@ -1129,7 +1153,7 @@ class DeleteTab(BaseTab):
         pbox = ttk.Frame(prev)
         pbox.pack(fill='both', expand=True, padx=6, pady=(2, 6))
         self.preview_text = tk.Text(pbox, height=3, state='disabled', wrap='none',
-                                    font=('Microsoft YaHei UI', 9))
+                                    font=(UI_FONT, 9))
         hsb = ttk.Scrollbar(pbox, orient='horizontal', command=self.preview_text.xview)
         self.preview_text.configure(xscrollcommand=hsb.set)
         hsb.pack(side='bottom', fill='x')
@@ -1399,7 +1423,7 @@ class SplitTab(BaseTab):
         pbox = ttk.Frame(prev)
         pbox.pack(fill='both', expand=True, padx=6, pady=(2, 6))
         self.preview_text = tk.Text(pbox, height=5, state='disabled', wrap='none',
-                                    font=('Microsoft YaHei UI', 9))
+                                    font=(UI_FONT, 9))
         hsb = ttk.Scrollbar(pbox, orient='horizontal', command=self.preview_text.xview)
         self.preview_text.configure(xscrollcommand=hsb.set)
         hsb.pack(side='bottom', fill='x')
@@ -1532,7 +1556,7 @@ class App(tk.Tk):
 
         for name in ('TkDefaultFont', 'TkTextFont', 'TkMenuFont'):
             try:
-                tkfont.nametofont(name).configure(family='Microsoft YaHei UI', size=9)
+                tkfont.nametofont(name).configure(family=UI_FONT, size=9)
             except tk.TclError:
                 pass
 
@@ -1549,11 +1573,12 @@ class App(tk.Tk):
 
 
 def main():
-    try:
-        from ctypes import windll
-        windll.shcore.SetProcessDpiAwareness(1)
-    except Exception:
-        pass
+    if IS_WIN:
+        try:
+            from ctypes import windll
+            windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            pass
     sys.excepthook = _excepthook
     app = App()
     app.mainloop()

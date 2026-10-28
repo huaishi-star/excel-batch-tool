@@ -4,8 +4,10 @@
 - rename: {名称: {"coords": [...], "separator": "..."}}
 - fill:   {名称: {"mapping": [["A1", "B2"], ...]}}
 
-配置文件默认保存在软件所在目录（便携，随 exe 拷贝带走）；
-若该目录不可写（如 Program Files），自动回退到 %APPDATA%\\Lsy的Excel-Tool\\。
+配置文件位置：
+- Windows：软件所在目录（便携，随 exe 拷贝带走）；不可写时回退到 %APPDATA%\\Lsy的Excel-Tool\\
+- macOS：~/Library/Application Support/Lsy的Excel-Tool/（.app 内部通常不可写，必须放用户目录）
+- Linux：$XDG_CONFIG_HOME/Lsy的Excel-Tool/（默认 ~/.config/Lsy的Excel-Tool/）
 """
 
 from __future__ import annotations
@@ -35,13 +37,24 @@ def _default_dir() -> Path:
 
 
 def _appdata_dir() -> Path:
+    """各平台的用户配置目录。"""
+    if sys.platform == 'darwin':
+        return Path.home() / 'Library' / 'Application Support' / 'Lsy的Excel-Tool'
+    if sys.platform.startswith('linux'):
+        base = os.environ.get('XDG_CONFIG_HOME', str(Path.home() / '.config'))
+        return Path(base) / 'Lsy的Excel-Tool'
     return Path(os.environ.get('APPDATA', str(Path.home()))) / 'Lsy的Excel-Tool'
 
 
 def config_paths() -> list[Path]:
     if _BASE is not None:
         return [_BASE / CONFIG_NAME]
-    return [_default_dir() / CONFIG_NAME, _appdata_dir() / CONFIG_NAME]
+    default = _default_dir() / CONFIG_NAME
+    appdata = _appdata_dir() / CONFIG_NAME
+    if sys.platform == 'darwin':
+        # macOS 的 .app 内部可能只读：优先用户数据目录，同时兼容脚本旁的旧配置
+        return [appdata, default]
+    return [default, appdata]
 
 
 def _load() -> dict:
@@ -68,8 +81,7 @@ def _save(data: dict) -> None:
     last_err: Exception | None = None
     for p in config_paths():
         try:
-            if p.parent == _appdata_dir():
-                p.parent.mkdir(parents=True, exist_ok=True)
+            p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(text, encoding='utf-8')
             return
         except OSError as e:
