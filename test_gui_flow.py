@@ -179,6 +179,51 @@ def run_delete(app):
     print('行/列删除 GUI 流程 PASS')
 
 
+def run_split(app):
+    """端口拆分 GUI 流程：预览排序依据 + 执行拆分/标红/汇总。"""
+    shutil.rmtree(OUT, ignore_errors=True)
+    OUT.mkdir()
+    from openpyxl import Workbook, load_workbook
+    src = OUT / '拆分源.xlsx'
+    wb = Workbook()
+    ws = wb.active
+    ws.append(['集客系统端口号', '流入速度', '流出速度', '备注'])
+    for row in [('P001', 10, 40, 'a'), ('P001', 20, 100, 'b'), ('P001', 30, 20, 'c'),
+                ('P001', 40, 80, 'd'), ('P001', 50, 0, 'e'), ('P001', 60, 60, 'f'),
+                ('P002', 5, 700, 'g'), ('P002', 15, 1000, 'h')]:
+        ws.append(row)
+    wb.save(src)
+
+    tab = app.split_tab
+    tab.picker.files = [str(src)]
+    tab.picker._refresh()
+    tab.highlight_var.set('5')
+    tab.out_var.set(str(OUT))
+
+    tab._do_preview()
+    assert pump_until_idle(tab), '端口拆分预览超时'
+    preview = tab.preview_text.get('1.0', 'end')
+    assert 'P001' in preview and '流出速度' in preview and '标红并汇总' in preview, preview
+    print('  [预览] 端口分组与排序依据正确')
+
+    tab._run()
+    assert pump_until_idle(tab), '端口拆分执行超时'
+    out = OUT / '拆分源_按端口拆分.xlsx'
+    assert out.exists(), '端口拆分输出不存在'
+    o = load_workbook(out)
+    assert o.sheetnames == ['P001', 'P002', '5行汇总'], o.sheetnames
+    assert [o['P001'].cell(row=5, column=c).value for c in range(1, 5)] == ['P001', 10, 40, 'a'], \
+        '第5行数据异常'
+    assert all(o['P001'].cell(row=5, column=c).font.color.rgb == 'FFFF0000'
+               for c in range(1, 5)), '第5行未标红'
+    assert o['5行汇总'].max_row == 2, '汇总表行数异常（P002 数据不足，不汇总）'
+    o.close()
+    log = tab.log_text.get('1.0', 'end')
+    assert '[OK]' in log and '成功 1 个' in log, log
+    print('  [执行] 2 个子表 + 1 个汇总表，第5行标红')
+    print('端口拆分 GUI 流程 PASS')
+
+
 def test_profiles():
     """规则/映射档案：保存 → 载入 → 删除；不保存文件列表/输出文件夹。"""
     with tempfile.TemporaryDirectory() as tmp:
@@ -280,6 +325,7 @@ def main():
         run_fill(a)
         run_fill_column(a)
         run_delete(a)
+        run_split(a)
         test_profiles()
         print('\n全部 GUI 流程测试通过 ✅')
     finally:

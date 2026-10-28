@@ -1,18 +1,23 @@
 """Excel 批量处理核心逻辑（GUI 无关，可独立测试）。
 
-提供两大能力：
+提供以下能力：
 1. 批量重命名：按"单元格组合"规则生成新文件名，复制到输出文件夹（原文件不动）
 2. 模板填充：把源文件的单元格值按映射关系填入模板对应单元格，保留模板格式
+3. 批量行/列删除：按条件删除整行/整列
+4. 端口拆分：按某一列的不同值拆成多个工作表，按流量列排序并标红指定行、汇总标红行
 
 注意：
 - 单元格定位一律使用文件/模板的第一个工作表（wb.worksheets[0]）
 - 读取使用 data_only=True, read_only=True；模板填充写入使用完整模式以保留格式
+- 端口拆分读取使用 read_only + write_only，避免大表（每个端口约 8928 行）占用过多内存
 """
 
 from __future__ import annotations
 
 import re
 import shutil
+import xml.etree.ElementTree as ET
+import zipfile
 from copy import copy
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -22,7 +27,9 @@ from typing import Callable, Iterable, Optional
 
 import xlrd
 import xlwt
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
+from openpyxl.cell import WriteOnlyCell
+from openpyxl.styles import Alignment, Border, Color, Font, PatternFill, Protection
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.cell import coordinate_from_string, column_index_from_string
 
@@ -1071,6 +1078,569 @@ def execute_delete(plan: list[DeleteItem], mode: str, terms: list, case_sensitiv
                 _delete_xls(item.src, item.dst, mode, terms, case_sensitive)
             else:
                 _delete_openpyxl(item.src, item.dst, mode, terms, case_sensitive)
+            ok += 1
+            log(f'[OK] {item.src.name} → {item.dst.name}')
+        except PermissionError:
+            skip += 1
+            log(f'[跳过] {item.src.name}：文件被占用，已跳过')
+        except Exception as e:
+            fail += 1
+            log(f'[失败] {item.src.name}：{e}')
+        if progress is not None:
+            progress(i + 1, total)
+    return {'ok': ok, 'skip': skip, 'fail': fail}
+
+
+# ---------------------------------------------------------------------------
+# 按端口号拆分 + 按流量排序 + 标红指定行
+# ---------------------------------------------------------------------------
+
+DEFAULT_PORT_HEADER = '集客系统端口号'
+DEFAULT_INFLOW_HEADER = '流入速度'
+DEFAULT_OUTFLOW_HEADER = '流出速度'
+DEFAULT_HIGHLIGHT_ROW = 448
+
+# xlsx 内部 XML 命名空间
+_XLSX_MAIN_NS = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
+_XLSX_REL_NS = '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}'
+
+
+@dataclass
+class SplitItem:
+    src: Path
+    dst: Path
+
+
+class _RowRecord:
+    """源表的一行：值、样式 id、流入/流出数值。"""
+
+    __slots__ = ('src_row', 'values', 'styles', 'inflow_num', 'outflow_num')
+
+    def __init__(self, src_row: int, values: tuple, styles: tuple,
+                 inflow_num, outflow_num):
+        self.src_row = src_row
+        self.values = values
+        self.styles = styles
+        self.inflow_num = inflow_num
+        self.outflow_num = outflow_num
+
+
+@dataclass
+class _GroupPlan:
+    value: str
+    records: list          # 已排序的 _RowRecord
+    inflow_total: float
+    outflow_total: float
+    sort_col: int
+    sort_name: str
+    invalid_sort_values: int
+    red_record: Optional[_RowRecord]
+
+
+@dataclass
+class _Prepared:
+    sheet_title: str
+    header_values: tuple
+    header_styles: tuple
+    max_col: int
+    total_rows: int
+    port_col: int
+    inflow_col: int
+    outflow_col: int
+    highlight_row: int
+    groups: list
+    style_plans: dict
+    layout: dict
+
+
+@dataclass
+class SplitGroupInfo:
+    value: str
+    row_count: int
+    inflow_total: float
+    outflow_total: float
+    sort_name: str
+    invalid_sort_values: int
+    red_source_row: Optional[int]
+
+
+@dataclass
+class SplitAnalysis:
+    path: Path
+    sheet_title: str
+    total_rows: int
+    highlight_row: int
+    groups: list
+    summary_rows: int
+
+
+def _norm_header(value) -> str:
+    """表头归一化：去掉所有空白、忽略大小写，便于匹配。"""
+    return re.sub(r'\s+', '', value_to_text(value)).casefold()
+
+
+def _at(seq, one_based_idx: int):
+    """取 1 基下标处的值，越界返回 None。"""
+    i = one_based_idx - 1
+    return seq[i] if 0 <= i < len(seq) else None
+
+
+def _display_port(value: str) -> str:
+    return value if value else '（空）'
+
+
+def _fmt_number(value: float) -> str:
+    """预览/日志中的数字格式：整数不带小数，其余保留两位。"""
+    if abs(value - round(value)) < 1e-9:
+        return f'{int(round(value)):,}'
+    return f'{value:,.2f}'
+
+
+def _natural_key(text: str) -> list:
+    """自然排序键：P2 排在 P10 前面。"""
+    parts = re.split(r'(\d+)', text)
+    return [(1, p.casefold()) if not p.isdigit() else (0, int(p)) for p in parts]
+
+
+def _safe_sheet_name(value: str, used: set) -> str:
+    """生成合法且不重复的工作表名（Excel 限制 31 字符，禁止 []:*?/\\）。"""
+    name = value_to_text(value)
+    name = CONTROL_CHARS_RE.sub('', name)
+    name = re.sub(r'[\[\]:*?/\\]', '_', name)
+    name = name.strip().strip("'").strip()
+    if not name:
+        name = '空值'
+    name = name[:31].rstrip("' ")
+    if not name:
+        name = '空值'
+    base = name
+    n = 2
+    while name.casefold() in used:
+        suffix = f'({n})'
+        name = base[:31 - len(suffix)].rstrip("' ") + suffix
+        n += 1
+    used.add(name.casefold())
+    return name
+
+
+def _capture_style(cell, cache: dict):
+    """记录单元格的样式 id，并把样式对象的副本缓存起来（源工作簿关闭后仍可用）。
+
+    ReadOnlyCell 只暴露 _style_id；EmptyCell 没有该属性，按默认样式处理。
+    """
+    sid = getattr(cell, '_style_id', None)
+    if sid is None:
+        return None
+    if sid not in cache:
+        cache[sid] = (
+            copy(cell.font), copy(cell.fill), copy(cell.border),
+            copy(cell.alignment), copy(cell.protection), cell.number_format,
+        )
+    return sid
+
+
+# openpyxl 默认样式（用于判断哪些属性无需逐单元格写入，显著加快大表写出）
+_DEFAULT_FONT = Font(name='Calibri', sz=11, family=2,
+                     color=Color(theme=1), scheme='minor')
+_DEFAULT_FILL = PatternFill()
+_DEFAULT_ALIGNMENT = Alignment()
+_DEFAULT_PROTECTION = Protection()
+
+
+def _border_is_empty(border) -> bool:
+    if border is None:
+        return True
+    for side in (border.left, border.right, border.top, border.bottom,
+                 border.diagonal, border.vertical, border.horizontal,
+                 border.start, border.end):
+        if side is not None and side.style is not None:
+            return False
+    return True
+
+
+def _style_plan(entry) -> tuple:
+    """把样式拆成"需要写入的属性"：与默认值相同的属性返回 None，写出时跳过。
+
+    大表里绝大多数单元格是默认样式，跳过这些赋值可以把写出速度提高数倍。
+    """
+    font, fill, border, alignment, protection, number_format = entry
+    return (
+        None if font == _DEFAULT_FONT else font,
+        None if fill == _DEFAULT_FILL else fill,
+        None if _border_is_empty(border) else border,
+        None if alignment == _DEFAULT_ALIGNMENT else alignment,
+        None if protection == _DEFAULT_PROTECTION else protection,
+        None if number_format in (None, '', 'General') else number_format,
+    )
+
+
+def _read_sheet_layout(path) -> dict:
+    """从 xlsx/xlsm 的 XML 头部读取列宽、隐藏列、冻结窗格。
+
+    列宽/窗格在 sheetData 之前，只解压前 512KB 即可，避免大表整段解析。
+    读取失败时返回空布局，不影响主流程。
+    """
+    layout = {'widths': {}, 'hidden': set(), 'freeze_panes': None}
+    try:
+        with zipfile.ZipFile(str(path)) as z:
+            wb_xml = ET.fromstring(z.read('xl/workbook.xml'))
+            sheet = wb_xml.find(f'{_XLSX_MAIN_NS}sheets/{_XLSX_MAIN_NS}sheet')
+            if sheet is None:
+                return layout
+            rid = sheet.get(f'{_XLSX_REL_NS}id')
+            rels = ET.fromstring(z.read('xl/_rels/workbook.xml.rels'))
+            target = None
+            for rel in rels:
+                if rel.get('Id') == rid:
+                    target = rel.get('Target')
+                    break
+            if not target:
+                return layout
+            target = target.lstrip('/')
+            if not target.startswith('xl/'):
+                target = 'xl/' + target
+            with z.open(target) as f:
+                text = f.read(512 * 1024).decode('utf-8', errors='ignore')
+
+        cols = re.search(r'<cols>(.*?)</cols>', text, re.S)
+        if cols:
+            for col in re.finditer(r'<col\b[^>]*/>', cols.group(1)):
+                attrs = dict(re.findall(r'([\w:]+)="([^"]*)"', col.group(0)))
+                try:
+                    mn = int(attrs.get('min', '1'))
+                    mx = int(attrs.get('max', str(mn)))
+                except ValueError:
+                    continue
+                width = attrs.get('width')
+                hidden = attrs.get('hidden') in ('1', 'true')
+                for i in range(mn, mx + 1):
+                    if width is not None:
+                        try:
+                            layout['widths'][i] = float(width)
+                        except ValueError:
+                            pass
+                    if hidden:
+                        layout['hidden'].add(i)
+
+        pane = re.search(r'<pane\b[^>]*/>', text)
+        if pane:
+            attrs = dict(re.findall(r'([\w:]+)="([^"]*)"', pane.group(0)))
+            if attrs.get('state') in ('frozen', 'frozenSplit'):
+                top = attrs.get('topLeftCell')
+                if top:
+                    layout['freeze_panes'] = top
+                else:
+                    try:
+                        x = int(attrs.get('xSplit') or 0)
+                        y = int(attrs.get('ySplit') or 0)
+                        layout['freeze_panes'] = f'{get_column_letter(x + 1)}{y + 1}'
+                    except ValueError:
+                        pass
+    except Exception:
+        return {'widths': {}, 'hidden': set(), 'freeze_panes': None}
+    return layout
+
+
+def _find_header_col(header_norms: list, wanted: str, label: str) -> int:
+    target = _norm_header(wanted)
+    if not target:
+        raise ValueError(f'{label}列名不能为空')
+    for i, h in enumerate(header_norms, start=1):
+        if h == target:
+            return i
+    shown = '、'.join(t for t in header_norms if t)[:120]
+    raise ValueError(f'未找到{label}列「{wanted}」。当前表头：{shown or "（空）"}')
+
+
+def _scan_prepare(path, port_header: str, inflow_header: str, outflow_header: str,
+                  highlight_row: int) -> _Prepared:
+    """读取源文件并完成分组、求和、排序，返回可直接写出的准备结果。"""
+    path = Path(path)
+    if path.suffix.lower() == '.xls':
+        raise ValueError('该功能暂不支持 .xls，请先在 Excel 中另存为 .xlsx 后再处理')
+    if path.suffix.lower() not in ('.xlsx', '.xlsm'):
+        raise ValueError('仅支持 .xlsx / .xlsm 文件')
+    try:
+        highlight_row = int(highlight_row)
+    except (TypeError, ValueError):
+        raise ValueError('标红行号必须是整数')
+    if highlight_row < 2:
+        raise ValueError('标红行号必须 ≥ 2（第 1 行是表头）')
+
+    wb = load_workbook(str(path), data_only=True, read_only=True)
+    try:
+        ws = wb.worksheets[0]
+        rows_iter = ws.iter_rows(min_row=1, values_only=False)
+        try:
+            header_cells = next(rows_iter)
+        except StopIteration:
+            raise ValueError('第一个工作表为空')
+        if not header_cells:
+            raise ValueError('第一个工作表没有表头')
+
+        style_cache: dict = {}
+        header_values = [c.value for c in header_cells]
+        header_styles = [_capture_style(c, style_cache) for c in header_cells]
+        max_col = max(int(ws.max_column or 0), len(header_values))
+
+        header_norms = [_norm_header(v) for v in header_values]
+        port_col = _find_header_col(header_norms, port_header, '端口号')
+        inflow_col = _find_header_col(header_norms, inflow_header, '流入速度')
+        outflow_col = _find_header_col(header_norms, outflow_header, '流出速度')
+        if len({port_col, inflow_col, outflow_col}) < 3:
+            raise ValueError('端口号、流入速度、流出速度必须对应三个不同的列')
+
+        groups: dict[str, list] = {}
+        inflow_totals: dict[str, float] = {}
+        outflow_totals: dict[str, float] = {}
+        total_rows = 0
+
+        for src_row, row in enumerate(rows_iter, start=2):
+            values = tuple(c.value for c in row)
+            if len(values) > max_col:
+                max_col = len(values)
+            if not any(v is not None and str(v).strip() != '' for v in values):
+                continue
+            styles = tuple(_capture_style(c, style_cache) for c in row)
+            key = value_to_text(_at(values, port_col)).strip()
+            inflow_num = _to_number(_at(values, inflow_col))
+            outflow_num = _to_number(_at(values, outflow_col))
+            groups.setdefault(key, []).append(
+                _RowRecord(src_row, values, styles, inflow_num, outflow_num))
+            inflow_totals[key] = inflow_totals.get(key, 0.0) + (inflow_num or 0.0)
+            outflow_totals[key] = outflow_totals.get(key, 0.0) + (outflow_num or 0.0)
+            total_rows += 1
+    finally:
+        wb.close()
+
+    if total_rows == 0:
+        raise ValueError('没有找到任何数据行')
+
+    plans: list = []
+    for key in sorted(groups, key=_natural_key):
+        records = groups[key]
+        inflow_total = inflow_totals.get(key, 0.0)
+        outflow_total = outflow_totals.get(key, 0.0)
+        # 总和相等时按流入速度排序（与"取较大者"的常规理解一致）
+        if inflow_total >= outflow_total:
+            sort_col, sort_name = inflow_col, (value_to_text(_at(header_values, inflow_col)).strip()
+                                               or inflow_header)
+        else:
+            sort_col, sort_name = outflow_col, (value_to_text(_at(header_values, outflow_col)).strip()
+                                                or outflow_header)
+
+        def sort_key(rec, _col=sort_col):
+            n = rec.inflow_num if _col == inflow_col else rec.outflow_num
+            # 数值在前按降序，非数值/空值排在最后（sort 稳定，保持原顺序）
+            return (n is None, -(n if n is not None else 0.0))
+
+        records.sort(key=sort_key)
+        invalid = sum(1 for rec in records
+                      if (rec.inflow_num if sort_col == inflow_col else rec.outflow_num) is None)
+        red_record = records[highlight_row - 2] if len(records) >= highlight_row - 1 else None
+        plans.append(_GroupPlan(
+            value=key,
+            records=records,
+            inflow_total=inflow_total,
+            outflow_total=outflow_total,
+            sort_col=sort_col,
+            sort_name=sort_name,
+            invalid_sort_values=invalid,
+            red_record=red_record,
+        ))
+
+    return _Prepared(
+        sheet_title=ws.title,
+        header_values=tuple(header_values),
+        header_styles=tuple(header_styles),
+        max_col=max_col,
+        total_rows=total_rows,
+        port_col=port_col,
+        inflow_col=inflow_col,
+        outflow_col=outflow_col,
+        highlight_row=highlight_row,
+        groups=plans,
+        style_plans={sid: _style_plan(entry) for sid, entry in style_cache.items()},
+        layout=_read_sheet_layout(path),
+    )
+
+
+def analyze_split(path, port_header: str = DEFAULT_PORT_HEADER,
+                  inflow_header: str = DEFAULT_INFLOW_HEADER,
+                  outflow_header: str = DEFAULT_OUTFLOW_HEADER,
+                  highlight_row: int = DEFAULT_HIGHLIGHT_ROW) -> SplitAnalysis:
+    """分析拆分结果（供预览），不写出文件。"""
+    prepared = _scan_prepare(path, port_header, inflow_header, outflow_header, highlight_row)
+    infos = [
+        SplitGroupInfo(
+            value=g.value,
+            row_count=len(g.records),
+            inflow_total=g.inflow_total,
+            outflow_total=g.outflow_total,
+            sort_name=g.sort_name,
+            invalid_sort_values=g.invalid_sort_values,
+            red_source_row=g.red_record.src_row if g.red_record is not None else None,
+        )
+        for g in prepared.groups
+    ]
+    return SplitAnalysis(
+        path=Path(path),
+        sheet_title=prepared.sheet_title,
+        total_rows=prepared.total_rows,
+        highlight_row=prepared.highlight_row,
+        groups=infos,
+        summary_rows=sum(1 for g in infos if g.red_source_row is not None),
+    )
+
+
+def preview_split(path, port_header: str = DEFAULT_PORT_HEADER,
+                  inflow_header: str = DEFAULT_INFLOW_HEADER,
+                  outflow_header: str = DEFAULT_OUTFLOW_HEADER,
+                  highlight_row: int = DEFAULT_HIGHLIGHT_ROW) -> list[str]:
+    """生成预览文本行。"""
+    a = analyze_split(path, port_header, inflow_header, outflow_header, highlight_row)
+    lines = [f'{a.path.name}：{a.total_rows} 行数据，{len(a.groups)} 个端口号']
+    for g in a.groups:
+        lines.append(
+            f'  · {_display_port(g.value)}：{g.row_count} 行；'
+            f'流入总和 {_fmt_number(g.inflow_total)}，流出总和 {_fmt_number(g.outflow_total)}'
+            f' → 按「{g.sort_name}」降序')
+        if g.red_source_row is None:
+            lines.append(f'    第 {a.highlight_row} 行：数据不足 {a.highlight_row - 1} 行，不标红')
+        else:
+            lines.append(f'    第 {a.highlight_row} 行：原第 {g.red_source_row} 行 → 标红并汇总')
+        if g.invalid_sort_values:
+            lines.append(f'    提示：排序列有 {g.invalid_sort_values} 个非数值，已排在最后')
+    lines.append(
+        f'  → 输出 {len(a.groups)} 个子表 + 1 个「{a.highlight_row}行汇总」，'
+        f'汇总标红行 {a.summary_rows} 行')
+    return lines
+
+
+def plan_split(files: Iterable, out_dir,
+               suffix: str = '_按端口拆分') -> tuple[list[SplitItem], list[tuple]]:
+    """生成拆分计划：每个源文件输出一个 .xlsx（内含多个子表 + 汇总表）。"""
+    used: set[str] = set()
+    plan: list[SplitItem] = []
+    errors: list[tuple] = []
+    for f in files:
+        f = Path(f)
+        if f.suffix.lower() not in ('.xlsx', '.xlsm'):
+            errors.append((f, '仅支持 .xlsx / .xlsm 文件'))
+            continue
+        try:
+            dst = build_dest_name(f'{f.stem}{suffix}', '.xlsx', out_dir, used)
+            used.add(dst.name.lower())
+            plan.append(SplitItem(src=f, dst=dst))
+        except Exception as e:
+            errors.append((f, str(e)))
+    return plan, errors
+
+
+def _apply_layout(ws, layout: dict, max_col: int):
+    """把列宽、隐藏列、冻结窗格应用到输出工作表。"""
+    if not layout:
+        return
+    widths = layout.get('widths') or {}
+    hidden = layout.get('hidden') or set()
+    for i in range(1, max_col + 1):
+        letter = get_column_letter(i)
+        if i in widths:
+            ws.column_dimensions[letter].width = widths[i]
+        if i in hidden:
+            ws.column_dimensions[letter].hidden = True
+    if layout.get('freeze_panes'):
+        ws.freeze_panes = layout['freeze_panes']
+
+
+def _make_row(ws, values, styles, prepared: _Prepared, red_font_cache=None):
+    """构造一行 WriteOnlyCell；red_font_cache 非 None 时整行字体标红。"""
+    cells = []
+    for i in range(prepared.max_col):
+        cell = WriteOnlyCell(ws, value=_at(values, i + 1))
+        sid = _at(styles, i + 1)
+        plan = prepared.style_plans.get(sid)
+        if plan is not None:
+            font, fill, border, alignment, protection, number_format = plan
+            if font is not None:
+                cell.font = font
+            if fill is not None:
+                cell.fill = fill
+            if border is not None:
+                cell.border = border
+            if alignment is not None:
+                cell.alignment = alignment
+            if protection is not None:
+                cell.protection = protection
+            if number_format is not None:
+                cell.number_format = number_format
+        if red_font_cache is not None:
+            red_font = red_font_cache.get(sid)
+            if red_font is None:
+                red_font = copy(cell.font)
+                red_font.color = Color(rgb='FFFF0000')
+                red_font_cache[sid] = red_font
+            cell.font = red_font
+        cells.append(cell)
+    return cells
+
+
+def _write_output(prepared: _Prepared, dst, log: LogFn):
+    """把准备结果写成一个 .xlsx：每个端口号一个子表 + 一个标红行汇总表。"""
+    out = Workbook(write_only=True)
+    used_titles: set[str] = set()
+    red_font_cache: dict = {}
+
+    for g in prepared.groups:
+        title = _safe_sheet_name(g.value, used_titles)
+        ws = out.create_sheet(title)
+        _apply_layout(ws, prepared.layout, prepared.max_col)
+        ws.append(_make_row(ws, prepared.header_values, prepared.header_styles, prepared))
+        for rec in g.records:
+            is_red = rec is g.red_record
+            ws.append(_make_row(ws, rec.values, rec.styles, prepared,
+                                red_font_cache if is_red else None))
+        if g.red_record is None:
+            note = f'数据不足 {prepared.highlight_row - 1} 行，未标红'
+        else:
+            note = f'第 {prepared.highlight_row} 行已标红'
+        log(f'[信息] 子表「{title}」：{len(g.records)} 行；'
+            f'流入总和 {_fmt_number(g.inflow_total)}，流出总和 {_fmt_number(g.outflow_total)}；'
+            f'按「{g.sort_name}」降序；{note}')
+
+    summary_title = _safe_sheet_name(f'{prepared.highlight_row}行汇总', used_titles)
+    sws = out.create_sheet(summary_title)
+    _apply_layout(sws, prepared.layout, prepared.max_col)
+    sws.append(_make_row(sws, prepared.header_values, prepared.header_styles, prepared))
+    for g in prepared.groups:
+        if g.red_record is not None:
+            sws.append(_make_row(sws, g.red_record.values, g.red_record.styles,
+                                 prepared, red_font_cache))
+    log(f'[信息] 汇总表「{summary_title}」：{sum(1 for g in prepared.groups if g.red_record)} 行')
+
+    out.save(str(dst))
+
+
+def execute_split(plan: list[SplitItem], port_header: str, inflow_header: str,
+                  outflow_header: str, highlight_row: int, log: LogFn,
+                  progress: Optional[ProgressFn] = None,
+                  cancel_event: Optional[Event] = None) -> dict:
+    """执行拆分计划。返回 {'ok': n, 'skip': n, 'fail': n}。"""
+    if not plan:
+        return {'ok': 0, 'skip': 0, 'fail': 0}
+    plan[0].dst.parent.mkdir(parents=True, exist_ok=True)
+    total = len(plan)
+    ok = skip = fail = 0
+    for i, item in enumerate(plan):
+        if cancel_event is not None and cancel_event.is_set():
+            log('[取消] 用户取消操作')
+            break
+        try:
+            log(f'[信息] 正在读取并分析 {item.src.name} …')
+            prepared = _scan_prepare(item.src, port_header, inflow_header,
+                                     outflow_header, highlight_row)
+            log(f'[信息] 共 {prepared.total_rows} 行、{len(prepared.groups)} 个端口号，开始写出 …')
+            _write_output(prepared, item.dst, log)
             ok += 1
             log(f'[OK] {item.src.name} → {item.dst.name}')
         except PermissionError:

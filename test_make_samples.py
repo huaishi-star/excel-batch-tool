@@ -99,6 +99,32 @@ def make_xls_samples():
     wb.save(OUT / '旧表格模板.xls')
 
 
+def make_split_sample():
+    """端口拆分测试用：3 个端口，流入/流出总和大的一方决定排序。"""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = '数据'
+    for c, v in enumerate(['集客系统端口号', '流入速度', '流出速度', '备注'], start=1):
+        ws.cell(row=1, column=c, value=v)
+    ws['A1'].font = Font(bold=True)
+    rows = [
+        ('P001', 10, 40, 'a'), ('P001', 20, 100, 'b'), ('P001', 30, 20, 'c'),
+        ('P001', 40, 80, 'd'), ('P001', 50, 0, 'e'), ('P001', 60, 60, 'f'),
+        ('P002', 5, 700, 'g'), ('P002', 15, 1000, 'h'), ('P002', 25, 800, 'i'),
+        ('P002', 35, 900, 'j'),
+        ('P003', 100, 1, 'k'), ('P003', 'N/A', 3, 'm'), ('P003', 200, 2, 'l'),
+    ]
+    thin = Side(style='thin')
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    for r, row in enumerate(rows, start=2):
+        for c, v in enumerate(row, start=1):
+            cell = ws.cell(row=r, column=c, value=v)
+            cell.border = border
+    ws.column_dimensions['A'].width = 18
+    ws.freeze_panes = 'A2'
+    wb.save(OUT / '拆分样例.xlsx')
+
+
 def main():
     OUT.mkdir(exist_ok=True)
     make_data('数据1.xlsx', {
@@ -140,6 +166,7 @@ def main():
     make_template()
     make_column_samples()
     make_xls_samples()
+    make_split_sample()
     print(f'样例文件已生成到：{OUT}')
 
 

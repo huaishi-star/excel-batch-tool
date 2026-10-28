@@ -1,9 +1,10 @@
 """Lsy的Excel-Tool — 图形界面入口。
 
-界面分三个标签页：
+界面分四个标签页：
 1. 批量重命名：按单元格组合规则复制重命名
 2. 模板填充：按映射关系把源文件数据填入模板
 3. 行/列删除：按条件批量删除行/列
+4. 端口拆分：按端口号拆分、按流量排序、标红指定行并汇总
 
 线程安全约定：工作线程只往 queue 里放消息，主线程用 after() 轮询并更新界面，
 工作线程绝不直接触碰任何 tkinter 控件。
@@ -1333,6 +1334,192 @@ class DeleteTab(BaseTab):
 
 
 # ---------------------------------------------------------------------------
+# Tab 4：端口拆分（按端口号拆表 + 流量排序 + 标红汇总）
+# ---------------------------------------------------------------------------
+
+class SplitTab(BaseTab):
+    def __init__(self, master):
+        super().__init__(master)
+        self._build()
+
+    def _build(self):
+        body = ScrollableFrame(self)
+        body.pack(fill='both', expand=True)
+
+        # ① 选择文件
+        picker = FilePicker(body.inner, text='① 选择要拆分的文件（.xlsx / .xlsm，按第一个工作表处理）')
+        picker.pack(fill='x', padx=8, pady=(8, 4))
+        self.picker = picker
+
+        # ② 拆分与排序设置
+        cfg = ttk.LabelFrame(body.inner, text='② 拆分与排序规则')
+        cfg.pack(fill='x', padx=8, pady=4)
+
+        row1 = ttk.Frame(cfg)
+        row1.pack(fill='x', padx=6, pady=(6, 2))
+        ttk.Label(row1, text='端口号列名：').pack(side='left')
+        self.port_entry = ttk.Entry(row1, width=16)
+        self.port_entry.insert(0, excel_core.DEFAULT_PORT_HEADER)
+        self.port_entry.pack(side='left')
+        ttk.Label(row1, text='  流入速度列名：').pack(side='left', padx=(10, 0))
+        self.inflow_entry = ttk.Entry(row1, width=12)
+        self.inflow_entry.insert(0, excel_core.DEFAULT_INFLOW_HEADER)
+        self.inflow_entry.pack(side='left')
+        ttk.Label(row1, text='  流出速度列名：').pack(side='left', padx=(10, 0))
+        self.outflow_entry = ttk.Entry(row1, width=12)
+        self.outflow_entry.insert(0, excel_core.DEFAULT_OUTFLOW_HEADER)
+        self.outflow_entry.pack(side='left')
+
+        row2 = ttk.Frame(cfg)
+        row2.pack(fill='x', padx=6, pady=(6, 2))
+        ttk.Label(row2, text='标红行号（含表头，第 1 行为表头）：').pack(side='left')
+        self.highlight_var = tk.StringVar(value=str(excel_core.DEFAULT_HIGHLIGHT_ROW))
+        ttk.Spinbox(row2, from_=2, to=1000000, width=8,
+                    textvariable=self.highlight_var).pack(side='left', padx=4)
+        ttk.Label(row2, text='排序后该行整行字体标红，并汇总到新子表',
+                  foreground='#57606a').pack(side='left', padx=6)
+
+        note = ttk.Frame(cfg)
+        note.pack(fill='x', padx=6, pady=(2, 6))
+        ttk.Label(
+            note,
+            text='规则：按端口号列的不同值拆分（表头保持一致）；分别计算每个子表「流入速度」与'
+                 '「流出速度」的总和，按总和较大的一列降序排列；非数值/空值排在最后。',
+            foreground='#57606a', wraplength=820, justify='left').pack(anchor='w')
+
+        # ③ 预览
+        prev = ttk.LabelFrame(body.inner, text='③ 预览（子表数量、排序依据、标红行）')
+        prev.pack(fill='x', padx=8, pady=4)
+        pframe = ttk.Frame(prev)
+        pframe.pack(fill='x', padx=6, pady=(6, 2))
+        self.preview_button = ttk.Button(pframe, text='预览', command=self._do_preview)
+        self.preview_button.pack(side='left')
+        ttk.Label(pframe, textvariable=self.status_var, foreground='#57606a').pack(side='left', padx=8)
+
+        pbox = ttk.Frame(prev)
+        pbox.pack(fill='both', expand=True, padx=6, pady=(2, 6))
+        self.preview_text = tk.Text(pbox, height=5, state='disabled', wrap='none',
+                                    font=('Microsoft YaHei UI', 9))
+        hsb = ttk.Scrollbar(pbox, orient='horizontal', command=self.preview_text.xview)
+        self.preview_text.configure(xscrollcommand=hsb.set)
+        hsb.pack(side='bottom', fill='x')
+        vsb = ttk.Scrollbar(pbox, orient='vertical', command=self.preview_text.yview)
+        self.preview_text.configure(yscrollcommand=vsb.set)
+        vsb.pack(side='right', fill='y')
+        self.preview_text.pack(side='left', fill='both', expand=True)
+
+        # ④ 输出与执行
+        out = ttk.LabelFrame(body.inner, text='④ 输出文件夹与执行（输出一个 .xlsx，内含各端口子表 + 标红行汇总表）')
+        out.pack(fill='x', padx=8, pady=4)
+        orow = ttk.Frame(out)
+        orow.pack(fill='x', padx=6, pady=(6, 2))
+        ttk.Label(orow, text='输出文件夹：').pack(side='left')
+        self.out_var = tk.StringVar()
+        ttk.Entry(orow, textvariable=self.out_var).pack(side='left', fill='x', expand=True)
+        ttk.Button(orow, text='浏览…', command=self._pick_outdir).pack(side='left', padx=4)
+
+        brow = ttk.Frame(out)
+        brow.pack(fill='x', padx=6, pady=(2, 6))
+        self.run_button = ttk.Button(brow, text='开始拆分', command=self._run)
+        self.run_button.pack(side='left')
+        self.cancel_button = ttk.Button(brow, text='取消', command=self._cancel, state='disabled')
+        self.cancel_button.pack(side='left', padx=4)
+
+        self._build_log_area(self)
+
+    def _pick_outdir(self):
+        d = filedialog.askdirectory(parent=self, title='选择输出文件夹')
+        if d:
+            self.out_var.set(d)
+
+    def _collect(self):
+        files = list(self.picker.files)
+        port_h = self.port_entry.get().strip()
+        inflow_h = self.inflow_entry.get().strip()
+        outflow_h = self.outflow_entry.get().strip()
+        highlight = self.highlight_var.get().strip()
+        out_dir = self.out_var.get().strip()
+        return files, port_h, inflow_h, outflow_h, highlight, out_dir
+
+    def _validate(self, files, port_h, inflow_h, outflow_h, highlight, out_dir) -> bool:
+        if not files:
+            messagebox.showwarning('提示', '请先选择要拆分的文件', parent=self)
+            return False
+        if not (port_h and inflow_h and outflow_h):
+            messagebox.showwarning('提示', '请填写端口号、流入速度、流出速度三个列名', parent=self)
+            return False
+        if len({port_h, inflow_h, outflow_h}) < 3:
+            messagebox.showwarning('提示', '三个列名不能相同', parent=self)
+            return False
+        try:
+            if int(highlight) < 2:
+                raise ValueError
+        except ValueError:
+            messagebox.showwarning('提示', '标红行号必须是 ≥ 2 的整数（第 1 行是表头）', parent=self)
+            return False
+        if not out_dir:
+            messagebox.showwarning('提示', '请选择输出文件夹', parent=self)
+            return False
+        bad = [f for f in files if Path(f).suffix.lower() not in ('.xlsx', '.xlsm')]
+        if bad:
+            messagebox.showwarning(
+                '提示',
+                '该功能仅支持 .xlsx / .xlsm 文件：\n' + '\n'.join(Path(f).name for f in bad[:8]),
+                parent=self)
+            return False
+        return True
+
+    def _do_preview(self):
+        files, port_h, inflow_h, outflow_h, highlight, out_dir = self._collect()
+        if not self._validate(files, port_h, inflow_h, outflow_h, highlight, out_dir):
+            return
+        self._clear_log()
+        self.start_worker(self._worker_preview,
+                          (files, port_h, inflow_h, outflow_h, int(highlight)))
+
+    def _run(self):
+        files, port_h, inflow_h, outflow_h, highlight, out_dir = self._collect()
+        if not self._validate(files, port_h, inflow_h, outflow_h, highlight, out_dir):
+            return
+        self._clear_log()
+        self.start_worker(self._worker_run,
+                          (files, port_h, inflow_h, outflow_h, int(highlight), out_dir))
+
+    # ---- 工作线程 ----
+    def _worker_preview(self, queue, cancel, files, port_h, inflow_h, outflow_h, highlight):
+        lines = []
+        for f in files:
+            try:
+                lines.extend(excel_core.preview_split(f, port_h, inflow_h, outflow_h, highlight))
+            except Exception as e:
+                lines.append(f'[错误] 无法读取 {Path(f).name}：{e}')
+            lines.append('')
+        queue.put(('preview', lines))
+        queue.put(('done', None))
+
+    def _worker_run(self, queue, cancel, files, port_h, inflow_h, outflow_h, highlight, out_dir):
+        log = lambda m: queue.put(('log', m))
+        plan, errors = excel_core.plan_split(files, out_dir)
+        for f, msg in errors:
+            log(f'[失败] {f}：{msg}')
+        if not plan:
+            queue.put(('error', '没有可处理的文件'))
+            queue.put(('done', None))
+            return
+        summary = excel_core.execute_split(
+            plan, port_h, inflow_h, outflow_h, highlight, log,
+            lambda d, t: queue.put(('progress', (d, t))), cancel)
+        queue.put(('done', summary))
+
+    def _show_preview(self, lines):
+        self.preview_text.configure(state='normal')
+        self.preview_text.delete('1.0', 'end')
+        self.preview_text.insert('end', '\n'.join(lines) + ('\n' if lines else ''))
+        self.preview_text.configure(state='disabled')
+        self.status_var.set(f'预览：共 {len(lines)} 行')
+
+
+# ---------------------------------------------------------------------------
 # 主窗口
 # ---------------------------------------------------------------------------
 
@@ -1354,9 +1541,11 @@ class App(tk.Tk):
         self.rename_tab = RenameTab(nb)
         self.fill_tab = FillTab(nb)
         self.delete_tab = DeleteTab(nb)
+        self.split_tab = SplitTab(nb)
         nb.add(self.rename_tab, text='批量重命名')
         nb.add(self.fill_tab, text='模板填充')
         nb.add(self.delete_tab, text='行/列删除')
+        nb.add(self.split_tab, text='端口拆分')
 
 
 def main():

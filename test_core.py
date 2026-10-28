@@ -654,6 +654,113 @@ def test_delete():
     check(ws2['A2'].value is None or ws2['A2'].value != '被删', '被删行已移除')
 
 
+def test_split():
+    """端口拆分：分组、按流量总和大的一列降序、标红指定行、汇总表。"""
+    from openpyxl import Workbook as WX, load_workbook as LW
+    from openpyxl.styles import Border, Font, Side
+    clean_out()
+
+    src = OUT / '拆分源.xlsx'
+    wb = WX()
+    ws = wb.active
+    ws.title = '数据'
+    headers = ['集客系统端口号', '流入速度', '流出速度', '备注']
+    for c, v in enumerate(headers, start=1):
+        ws.cell(row=1, column=c, value=v)
+    ws['A1'].font = Font(bold=True)
+
+    rows = [
+        ('P001', 10, 40, 'a'), ('P001', 20, 100, 'b'), ('P001', 30, 20, 'c'),
+        ('P001', 40, 80, 'd'), ('P001', 50, 0, 'e'), ('P001', 60, 60, 'f'),
+        ('P002', 5, 700, 'g'), ('P002', 15, 1000, 'h'), ('P002', 25, 800, 'i'),
+        ('P002', 35, 900, 'j'),
+        ('P003', 100, 1, 'k'), ('P003', 'N/A', 3, 'm'), ('P003', 200, 2, 'l'),
+    ]
+    thin = Side(style='thin')
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    for r, row in enumerate(rows, start=2):
+        for c, v in enumerate(row, start=1):
+            cell = ws.cell(row=r, column=c, value=v)
+            cell.border = border
+    ws.column_dimensions['A'].width = 18
+    ws.column_dimensions['B'].width = 12
+    ws.freeze_panes = 'A2'
+    wb.save(src)
+
+    # --- 分析（标红行用 5，避免生成 448 行）---
+    a = excel_core.analyze_split(str(src), highlight_row=5)
+    check(a.total_rows == 13, f'总数据行 13（实际 {a.total_rows}）')
+    check([g.value for g in a.groups] == ['P001', 'P002', 'P003'],
+          f'端口分组 {[g.value for g in a.groups]}')
+    g1, g2, g3 = a.groups
+    check(g1.sort_name == '流出速度' and g1.inflow_total == 210 and g1.outflow_total == 300,
+          f'P001 按流出速度排序（{g1.inflow_total}/{g1.outflow_total}）')
+    check(g2.sort_name == '流出速度' and g2.outflow_total == 3400, 'P002 按流出速度排序')
+    check(g3.sort_name == '流入速度' and g3.inflow_total == 300, 'P003 按流入速度排序')
+    check(g3.invalid_sort_values == 1, 'P003 非数值 1 个')
+    check((g1.red_source_row, g2.red_source_row, g3.red_source_row) == (2, 8, None),
+          f'标红来源行 {(g1.red_source_row, g2.red_source_row, g3.red_source_row)}')
+    check(a.summary_rows == 2, f'汇总 2 行（实际 {a.summary_rows}）')
+
+    prev = '\n'.join(excel_core.preview_split(str(src), highlight_row=5))
+    check('P001' in prev and '流出速度' in prev and '标红并汇总' in prev, '预览文本包含关键信息')
+
+    # 表头缺失时报错
+    try:
+        excel_core.analyze_split(str(src), port_header='不存在的列', highlight_row=5)
+        check(False, '缺失列名应报错')
+    except ValueError as e:
+        check('未找到端口号列' in str(e), f'缺失列名报错：{e}')
+
+    # --- 执行 ---
+    plan, errors = excel_core.plan_split([str(src)], OUT)
+    check(not errors and len(plan) == 1, '生成 1 个拆分计划')
+    check(plan[0].dst.name == '拆分源_按端口拆分.xlsx', f'输出文件名 {plan[0].dst.name}')
+    summary = excel_core.execute_split(
+        plan, '集客系统端口号', '流入速度', '流出速度', 5, log)
+    check(summary['ok'] == 1, f'执行成功 {summary}')
+
+    out = LW(plan[0].dst)
+    check(out.sheetnames == ['P001', 'P002', 'P003', '5行汇总'],
+          f'工作表 {out.sheetnames}')
+    for name in out.sheetnames:
+        check([c.value for c in out[name][1]] == headers, f'{name} 表头与原表一致')
+
+    remarks = lambda name: [out[name].cell(row=r, column=4).value
+                            for r in range(2, out[name].max_row + 1)]
+    check(remarks('P001') == ['b', 'd', 'f', 'a', 'c', 'e'],
+          f'P001 按流出速度降序 {remarks("P001")}')
+    check(remarks('P002') == ['h', 'j', 'i', 'g'],
+          f'P002 按流出速度降序 {remarks("P002")}')
+    check(remarks('P003') == ['l', 'k', 'm'],
+          f'P003 按流入速度降序、非数值最后 {remarks("P003")}')
+
+    # 第 5 行整行标红（含空列），其余数据行不红
+    for name in ('P001', 'P002'):
+        colors = [out[name].cell(row=5, column=c).font.color
+                  for c in range(1, 5)]
+        check(all(c is not None and c.rgb == 'FFFF0000' for c in colors),
+              f'{name} 第 5 行整行标红')
+    check(out['P003'].cell(row=2, column=1).font.color is None
+          or out['P003'].cell(row=2, column=1).font.color.rgb != 'FFFF0000',
+          'P003 数据不足，不标红')
+
+    # 汇总表内容与标红行一致，且同样标红
+    check([out['5行汇总'].cell(row=r, column=4).value for r in (2, 3)] == ['a', 'g'],
+          '汇总表包含 P001/P002 的第 5 行')
+    for r in (2, 3):
+        colors = [out['5行汇总'].cell(row=r, column=c).font.color for c in range(1, 5)]
+        check(all(c is not None and c.rgb == 'FFFF0000' for c in colors),
+              f'汇总表第 {r} 行标红')
+
+    # 样式/列宽/冻结窗格保留
+    check(out['P001']['A1'].font.bold is True, '表头加粗样式保留')
+    check(out['P001'].cell(row=2, column=1).border.left.style == 'thin', '数据边框保留')
+    check(out['P001'].column_dimensions['A'].width == 18, '列宽保留')
+    check(out['P001'].freeze_panes == 'A2', '冻结窗格保留')
+    out.close()
+
+
 if __name__ == '__main__':
     test_rename()
     test_rename_advanced()
@@ -665,4 +772,5 @@ if __name__ == '__main__':
     test_fill_merged_cell()
     test_fill_sum()
     test_delete()
+    test_split()
     print('\n全部测试通过 ✅')
